@@ -10,6 +10,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <memory>
 #include <exception>
@@ -785,6 +786,44 @@ void detect_filter_destroy(void *data)
 	}
 }
 
+/* The frame grab (getRGBAFromStageSurface) re-renders the source through its
+   filter chain, so once our own tracking crop is active the captured image IS
+   the zoomed output - a feedback loop that compounds zoom until the crop
+   implodes. All zoom math must therefore live in raw source space: captured
+   coordinates are mapped back through the crop we applied, and raw-space
+   values (like the detection region) mapped forward. */
+static void get_capture_map(struct detect_filter *tf, int capturedW, int capturedH, int &rawW,
+			    int &rawH, float &scaleX, float &scaleY, float &offsetX,
+			    float &offsetY)
+{
+	rawW = capturedW;
+	rawH = capturedH;
+	obs_source_t *parent = obs_filter_get_parent(tf->source);
+	if (parent) {
+		const int pw = (int)obs_source_get_base_width(parent);
+		const int ph = (int)obs_source_get_base_height(parent);
+		if (pw > 0 && ph > 0) {
+			rawW = pw;
+			rawH = ph;
+		}
+	}
+	scaleX = 1.0f;
+	scaleY = 1.0f;
+	offsetX = 0.0f;
+	offsetY = 0.0f;
+	const cv::Rect2f &r = tf->trackingRect;
+	const bool cropApplied = tf->trackingEnabled && tf->trackingFilter && r.width > 1.0f &&
+				 r.height > 1.0f &&
+				 (r.x > 0.5f || r.y > 0.5f || r.width < (float)rawW - 0.5f ||
+				  r.height < (float)rawH - 0.5f);
+	if (cropApplied && capturedW > 0 && capturedH > 0) {
+		scaleX = r.width / (float)capturedW;
+		scaleY = r.height / (float)capturedH;
+		offsetX = r.x;
+		offsetY = r.y;
+	}
+}
+
 void detect_filter_video_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -815,11 +854,26 @@ void detect_filter_video_tick(void *data, float seconds)
 
 	cv::Mat inferenceFrame;
 
+	// the detection region is calibrated in raw source pixels; the captured
+	// frame may be our own zoomed output, so transform the region into
+	// captured-image space before applying it
 	cv::Rect cropRect(0, 0, imageBGRA.cols, imageBGRA.rows);
 	if (tf->crop_enabled) {
-		cropRect = cv::Rect(tf->crop_left, tf->crop_top,
-				    imageBGRA.cols - tf->crop_left - tf->crop_right,
-				    imageBGRA.rows - tf->crop_top - tf->crop_bottom);
+		int rawW, rawH;
+		float sx, sy, ox, oy;
+		get_capture_map(tf, imageBGRA.cols, imageBGRA.rows, rawW, rawH, sx, sy, ox, oy);
+		const float fx = ((float)tf->crop_left - ox) / sx;
+		const float fy = ((float)tf->crop_top - oy) / sy;
+		const float fr = ((float)(rawW - tf->crop_right) - ox) / sx;
+		const float fb = ((float)(rawH - tf->crop_bottom) - oy) / sy;
+		cv::Rect fence((int)fx, (int)fy, (int)(fr - fx), (int)(fb - fy));
+		fence &= cv::Rect(0, 0, imageBGRA.cols, imageBGRA.rows);
+		// when the zoomed view lies fully inside the region, fencing is moot
+		if (fence.width > 20 && fence.height > 20) {
+			cropRect = fence;
+		}
+	}
+	if (cropRect.width < imageBGRA.cols || cropRect.height < imageBGRA.rows) {
 		cv::cvtColor(imageBGRA(cropRect), inferenceFrame, cv::COLOR_BGRA2BGR);
 	} else {
 		cv::cvtColor(imageBGRA, inferenceFrame, cv::COLOR_BGRA2BGR);
@@ -974,76 +1028,99 @@ void detect_filter_video_tick(void *data, float seconds)
 		const int width = imageBGRA.cols;
 		const int height = imageBGRA.rows;
 
-		cv::Rect2f boundingBox = cv::Rect2f(0, 0, (float)width, (float)height);
-		// get location of the objects
+		// capture-space -> raw-space mapping (must be taken BEFORE this
+		// frame's trackingRect update: it describes the crop in effect
+		// when the frame was captured)
+		int rawW, rawH;
+		float mapSx, mapSy, mapOx, mapOy;
+		get_capture_map(tf, width, height, rawW, rawH, mapSx, mapSy, mapOx, mapOy);
+
+		// select the target object in captured-image space; only currently
+		// visible objects may be targeted (unseen ones are Kalman
+		// predictions that degenerate without corrections)
+		bool found = false;
+		cv::Rect2f targetBox;
 		if (tf->zoomObject == "single") {
-			if (objects.size() > 0) {
-				// find first visible object
-				for (const Object &obj : objects) {
-					if (obj.unseenFrames == 0) {
-						boundingBox = obj.rect;
-						break;
-					}
+			for (const Object &obj : objects) {
+				if (obj.unseenFrames == 0) {
+					targetBox = obj.rect;
+					found = true;
+					break;
 				}
 			}
 		} else if (tf->zoomObject == "biggest") {
-			// get the bounding box of the biggest object
-			if (objects.size() > 0) {
-				float maxArea = 0;
-				for (const Object &obj : objects) {
-					const float area = obj.rect.width * obj.rect.height;
-					if (area > maxArea) {
-						maxArea = area;
-						boundingBox = obj.rect;
-					}
+			float maxArea = 0;
+			for (const Object &obj : objects) {
+				if (obj.unseenFrames > 0)
+					continue;
+				const float area = obj.rect.width * obj.rect.height;
+				if (area > maxArea) {
+					maxArea = area;
+					targetBox = obj.rect;
+					found = true;
 				}
 			}
 		} else if (tf->zoomObject == "oldest") {
-			// get the object with the oldest id that's visible currently
-			if (objects.size() > 0) {
-				uint64_t oldestId = UINT64_MAX;
-				for (const Object &obj : objects) {
-					if (obj.unseenFrames == 0 && obj.id < oldestId) {
-						oldestId = obj.id;
-						boundingBox = obj.rect;
-					}
+			uint64_t oldestId = UINT64_MAX;
+			for (const Object &obj : objects) {
+				if (obj.unseenFrames == 0 && obj.id < oldestId) {
+					oldestId = obj.id;
+					targetBox = obj.rect;
+					found = true;
 				}
 			}
 		} else {
-			// get the bounding box of all objects
-			if (objects.size() > 0) {
-				boundingBox = objects[0].rect;
-				for (const Object &obj : objects) {
-					if (obj.unseenFrames > 0) {
-						continue;
-					}
-					boundingBox |= obj.rect;
+			// bounding box of all currently visible objects
+			for (const Object &obj : objects) {
+				if (obj.unseenFrames > 0)
+					continue;
+				if (!found) {
+					targetBox = obj.rect;
+					found = true;
+				} else {
+					targetBox |= obj.rect;
 				}
 			}
 		}
-		bool lostTracking = objects.size() == 0;
-		// the zooming box should maintain the aspect ratio of the image
-		// with the tf->zoomFactor controlling the effective buffer around the bounding box
-		// the bounding box is the center of the zooming box
-		float frameAspectRatio = (float)width / (float)height;
-		// calculate an aspect ratio box around the object using its height
-		float boxHeight = boundingBox.height;
-		// calculate the zooming box size
-		float dh = (float)height - boxHeight;
+
+		// map to raw source space; degenerate/non-finite boxes count as lost
+		cv::Rect2f boundingBox;
+		if (found) {
+			boundingBox = cv::Rect2f(mapOx + targetBox.x * mapSx,
+						 mapOy + targetBox.y * mapSy,
+						 targetBox.width * mapSx, targetBox.height * mapSy);
+			if (!std::isfinite(boundingBox.x) || !std::isfinite(boundingBox.y) ||
+			    !std::isfinite(boundingBox.width) ||
+			    !std::isfinite(boundingBox.height) || boundingBox.width < 2.0f ||
+			    boundingBox.height < 2.0f) {
+				found = false;
+			}
+		}
+		if (!found) {
+			boundingBox = cv::Rect2f(0, 0, (float)rawW, (float)rawH);
+		}
+		bool lostTracking = !found;
+
+		// the zooming box maintains the raw frame's aspect ratio, with
+		// tf->zoomFactor controlling the buffer around the bounding box
+		float frameAspectRatio = (float)rawW / (float)rawH;
+		float boxHeight = std::min(boundingBox.height, (float)rawH);
+		float dh = (float)rawH - boxHeight;
 		float buffer = dh * (1.0f - tf->zoomFactor);
 		float zh = boxHeight + buffer;
+		// hard floor: the zoom window can never implode, whatever happens
+		zh = std::max(zh, (float)rawH * 0.15f);
 		float zw = zh * frameAspectRatio;
-		// calculate the top left corner of the zooming box
 		float zx = boundingBox.x - (zw - boundingBox.width) / 2.0f;
 		float zy = boundingBox.y - (zh - boundingBox.height) / 2.0f;
 
 		// keep the zooming box inside the frame: when the target is near an
 		// edge, slide the box to hug that edge instead of centering the
 		// target and padding the out-of-frame area with black
-		zw = std::min(zw, (float)width);
-		zh = std::min(zh, (float)height);
-		zx = std::max(0.0f, std::min(zx, (float)width - zw));
-		zy = std::max(0.0f, std::min(zy, (float)height - zh));
+		zw = std::min(zw, (float)rawW);
+		zh = std::min(zh, (float)rawH);
+		zx = std::max(0.0f, std::min(zx, (float)rawW - zw));
+		zy = std::max(0.0f, std::min(zy, (float)rawH - zh));
 
 		if (tf->trackingRect.width == 0) {
 			// initialize the trackingRect
@@ -1061,29 +1138,28 @@ void detect_filter_video_tick(void *data, float seconds)
 				tf->trackingRect.height + factor * (zh - tf->trackingRect.height);
 		}
 
-		// clamp the smoothed rect too, so the crop can never pad black
-		// (covers rects inherited from before clamping and lerp edge cases)
-		tf->trackingRect.width = std::min(tf->trackingRect.width, (float)width);
-		tf->trackingRect.height = std::min(tf->trackingRect.height, (float)height);
+		// clamp the smoothed rect in raw space, with the same implosion
+		// floor, so the applied crop is always a sane window
+		tf->trackingRect.width = std::max(std::min(tf->trackingRect.width, (float)rawW),
+						  (float)rawW * 0.15f);
+		tf->trackingRect.height = std::max(std::min(tf->trackingRect.height, (float)rawH),
+						   (float)rawH * 0.15f);
 		tf->trackingRect.x = std::max(
-			0.0f, std::min(tf->trackingRect.x, (float)width - tf->trackingRect.width));
+			0.0f, std::min(tf->trackingRect.x, (float)rawW - tf->trackingRect.width));
 		tf->trackingRect.y = std::max(
 			0.0f,
-			std::min(tf->trackingRect.y, (float)height - tf->trackingRect.height));
+			std::min(tf->trackingRect.y, (float)rawH - tf->trackingRect.height));
 
-		// get the settings of the crop/pad filter
+		// apply to the crop/pad filter (values are raw-frame pixels)
 		obs_data_t *crop_pad_settings = obs_source_get_settings(tf->trackingFilter);
 		obs_data_set_int(crop_pad_settings, "left", (int)tf->trackingRect.x);
 		obs_data_set_int(crop_pad_settings, "top", (int)tf->trackingRect.y);
-		// right = image width - (zx + zw)
 		obs_data_set_int(
 			crop_pad_settings, "right",
-			(int)((float)width - (tf->trackingRect.x + tf->trackingRect.width)));
-		// bottom = image height - (zy + zh)
+			(int)((float)rawW - (tf->trackingRect.x + tf->trackingRect.width)));
 		obs_data_set_int(
 			crop_pad_settings, "bottom",
-			(int)((float)height - (tf->trackingRect.y + tf->trackingRect.height)));
-		// apply the settings
+			(int)((float)rawH - (tf->trackingRect.y + tf->trackingRect.height)));
 		obs_source_update(tf->trackingFilter, crop_pad_settings);
 		obs_data_release(crop_pad_settings);
 	}
