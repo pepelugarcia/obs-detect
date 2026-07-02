@@ -9,6 +9,7 @@
 
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <numeric>
 #include <memory>
 #include <exception>
@@ -1012,6 +1013,14 @@ void detect_filter_video_tick(void *data, float seconds)
 		float zx = boundingBox.x - (zw - boundingBox.width) / 2.0f;
 		float zy = boundingBox.y - (zh - boundingBox.height) / 2.0f;
 
+		// keep the zooming box inside the frame: when the target is near an
+		// edge, slide the box to hug that edge instead of centering the
+		// target and padding the out-of-frame area with black
+		zw = std::min(zw, (float)width);
+		zh = std::min(zh, (float)height);
+		zx = std::max(0.0f, std::min(zx, (float)width - zw));
+		zy = std::max(0.0f, std::min(zy, (float)height - zh));
+
 		if (tf->trackingRect.width == 0) {
 			// initialize the trackingRect
 			tf->trackingRect = cv::Rect2f(zx, zy, zw, zh);
@@ -1027,6 +1036,16 @@ void detect_filter_video_tick(void *data, float seconds)
 			tf->trackingRect.height =
 				tf->trackingRect.height + factor * (zh - tf->trackingRect.height);
 		}
+
+		// clamp the smoothed rect too, so the crop can never pad black
+		// (covers rects inherited from before clamping and lerp edge cases)
+		tf->trackingRect.width = std::min(tf->trackingRect.width, (float)width);
+		tf->trackingRect.height = std::min(tf->trackingRect.height, (float)height);
+		tf->trackingRect.x = std::max(
+			0.0f, std::min(tf->trackingRect.x, (float)width - tf->trackingRect.width));
+		tf->trackingRect.y = std::max(
+			0.0f,
+			std::min(tf->trackingRect.y, (float)height - tf->trackingRect.height));
 
 		// get the settings of the crop/pad filter
 		obs_data_t *crop_pad_settings = obs_source_get_settings(tf->trackingFilter);
