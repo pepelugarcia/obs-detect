@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <numeric>
 #include <memory>
 #include <exception>
@@ -1112,6 +1113,18 @@ void detect_filter_video_tick(void *data, float seconds)
 			(int)((float)rawH - (tf->trackingRect.y + tf->trackingRect.height)));
 		obs_source_update(tf->trackingFilter, crop_pad_settings);
 		obs_data_release(crop_pad_settings);
+
+		// throttled geometry diagnostic: lets stability be verified from the
+		// log with measured numbers instead of assumptions
+		static std::atomic<int> diag_counter{0};
+		if (++diag_counter % 600 == 0) {
+			obs_log(LOG_INFO,
+				"[detect-diag] '%s' captured %dx%d %s box %.0fx%.0f rect %.0f,%.0f %.0fx%.0f",
+				obs_source_get_name(obs_filter_get_parent(tf->source)), rawW, rawH,
+				lostTracking ? "lost" : "live", boundingBox.width, boundingBox.height,
+				tf->trackingRect.x, tf->trackingRect.y, tf->trackingRect.width,
+				tf->trackingRect.height);
+		}
 	}
 }
 
