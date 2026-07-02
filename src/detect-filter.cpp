@@ -946,6 +946,25 @@ void detect_filter_video_tick(void *data, float seconds)
 		cv::cvtColor(frame, tf->outputPreviewBGRA, cv::COLOR_BGR2BGRA);
 	}
 
+	if (tf->trackingEnabled && !tf->trackingFilter) {
+		// the startup settings-update can run before this filter is attached
+		// to its parent source ("Parent source not found"), which leaves the
+		// crop-filter handle unset and tracking silently dead until the user
+		// toggles it. Re-acquire the handle here once the parent exists.
+		obs_source_t *parent = obs_filter_get_parent(tf->source);
+		if (parent) {
+			obs_source_t *crop_pad_filter =
+				obs_source_get_filter_by_name(parent, "Detect Tracking");
+			if (!crop_pad_filter) {
+				crop_pad_filter = obs_source_create(
+					"crop_filter", "Detect Tracking", nullptr, nullptr);
+				obs_source_filter_add(parent, crop_pad_filter);
+			}
+			tf->trackingFilter = crop_pad_filter;
+			obs_log(LOG_INFO, "Tracking crop filter acquired after startup");
+		}
+	}
+
 	if (tf->trackingEnabled && tf->trackingFilter) {
 		const int width = imageBGRA.cols;
 		const int height = imageBGRA.rows;
