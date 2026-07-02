@@ -786,44 +786,6 @@ void detect_filter_destroy(void *data)
 	}
 }
 
-/* The frame grab (getRGBAFromStageSurface) re-renders the source through its
-   filter chain, so once our own tracking crop is active the captured image IS
-   the zoomed output - a feedback loop that compounds zoom until the crop
-   implodes. All zoom math must therefore live in raw source space: captured
-   coordinates are mapped back through the crop we applied, and raw-space
-   values (like the detection region) mapped forward. */
-static void get_capture_map(struct detect_filter *tf, int capturedW, int capturedH, int &rawW,
-			    int &rawH, float &scaleX, float &scaleY, float &offsetX,
-			    float &offsetY)
-{
-	rawW = capturedW;
-	rawH = capturedH;
-	obs_source_t *parent = obs_filter_get_parent(tf->source);
-	if (parent) {
-		const int pw = (int)obs_source_get_base_width(parent);
-		const int ph = (int)obs_source_get_base_height(parent);
-		if (pw > 0 && ph > 0) {
-			rawW = pw;
-			rawH = ph;
-		}
-	}
-	scaleX = 1.0f;
-	scaleY = 1.0f;
-	offsetX = 0.0f;
-	offsetY = 0.0f;
-	const cv::Rect2f &r = tf->trackingRect;
-	const bool cropApplied = tf->trackingEnabled && tf->trackingFilter && r.width > 1.0f &&
-				 r.height > 1.0f &&
-				 (r.x > 0.5f || r.y > 0.5f || r.width < (float)rawW - 0.5f ||
-				  r.height < (float)rawH - 0.5f);
-	if (cropApplied && capturedW > 0 && capturedH > 0) {
-		scaleX = r.width / (float)capturedW;
-		scaleY = r.height / (float)capturedH;
-		offsetX = r.x;
-		offsetY = r.y;
-	}
-}
-
 void detect_filter_video_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -854,21 +816,15 @@ void detect_filter_video_tick(void *data, float seconds)
 
 	cv::Mat inferenceFrame;
 
-	// the detection region is calibrated in raw source pixels; the captured
-	// frame may be our own zoomed output, so transform the region into
-	// captured-image space before applying it
+	// the captured frame is the parent's RAW output (no filters), so the
+	// detection region applies directly in source pixels; guard against
+	// out-of-range values instead of trusting them blindly
 	cv::Rect cropRect(0, 0, imageBGRA.cols, imageBGRA.rows);
 	if (tf->crop_enabled) {
-		int rawW, rawH;
-		float sx, sy, ox, oy;
-		get_capture_map(tf, imageBGRA.cols, imageBGRA.rows, rawW, rawH, sx, sy, ox, oy);
-		const float fx = ((float)tf->crop_left - ox) / sx;
-		const float fy = ((float)tf->crop_top - oy) / sy;
-		const float fr = ((float)(rawW - tf->crop_right) - ox) / sx;
-		const float fb = ((float)(rawH - tf->crop_bottom) - oy) / sy;
-		cv::Rect fence((int)fx, (int)fy, (int)(fr - fx), (int)(fb - fy));
+		cv::Rect fence(tf->crop_left, tf->crop_top,
+			       imageBGRA.cols - tf->crop_left - tf->crop_right,
+			       imageBGRA.rows - tf->crop_top - tf->crop_bottom);
 		fence &= cv::Rect(0, 0, imageBGRA.cols, imageBGRA.rows);
-		// when the zoomed view lies fully inside the region, fencing is moot
 		if (fence.width > 20 && fence.height > 20) {
 			cropRect = fence;
 		}
@@ -1025,19 +981,15 @@ void detect_filter_video_tick(void *data, float seconds)
 	}
 
 	if (tf->trackingEnabled && tf->trackingFilter) {
-		const int width = imageBGRA.cols;
-		const int height = imageBGRA.rows;
+		// the captured frame is the parent's raw output, so detections are
+		// already in raw source pixels - the same space the crop filter
+		// operates in
+		const int rawW = imageBGRA.cols;
+		const int rawH = imageBGRA.rows;
 
-		// capture-space -> raw-space mapping (must be taken BEFORE this
-		// frame's trackingRect update: it describes the crop in effect
-		// when the frame was captured)
-		int rawW, rawH;
-		float mapSx, mapSy, mapOx, mapOy;
-		get_capture_map(tf, width, height, rawW, rawH, mapSx, mapSy, mapOx, mapOy);
-
-		// select the target object in captured-image space; only currently
-		// visible objects may be targeted (unseen ones are Kalman
-		// predictions that degenerate without corrections)
+		// select the target object; only currently visible objects may be
+		// targeted (unseen ones are Kalman predictions that degenerate
+		// without corrections)
 		bool found = false;
 		cv::Rect2f targetBox;
 		if (tf->zoomObject == "single") {
@@ -1083,12 +1035,10 @@ void detect_filter_video_tick(void *data, float seconds)
 			}
 		}
 
-		// map to raw source space; degenerate/non-finite boxes count as lost
+		// degenerate/non-finite boxes count as lost
 		cv::Rect2f boundingBox;
 		if (found) {
-			boundingBox = cv::Rect2f(mapOx + targetBox.x * mapSx,
-						 mapOy + targetBox.y * mapSy,
-						 targetBox.width * mapSx, targetBox.height * mapSy);
+			boundingBox = targetBox;
 			if (!std::isfinite(boundingBox.x) || !std::isfinite(boundingBox.y) ||
 			    !std::isfinite(boundingBox.width) ||
 			    !std::isfinite(boundingBox.height) || boundingBox.width < 2.0f ||

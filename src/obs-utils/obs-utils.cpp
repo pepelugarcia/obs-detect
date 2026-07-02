@@ -19,7 +19,13 @@ bool getRGBAFromStageSurface(filter_data *tf, uint32_t &width, uint32_t &height)
 		return false;
 	}
 
-	obs_source_t *target = obs_filter_get_target(tf->source);
+	/* Capture the parent source's RAW output (no filters). Rendering the
+	   filter target re-renders the source THROUGH its filter chain, so any
+	   filter this plugin adds downstream (e.g. the tracking crop) feeds
+	   back into detection - a self-zoom loop. Raw capture keeps detection
+	   coordinates in stable source pixels regardless of the chain. */
+	obs_source_t *parent = obs_filter_get_parent(tf->source);
+	obs_source_t *target = parent ? parent : obs_filter_get_target(tf->source);
 	if (!target) {
 		return false;
 	}
@@ -39,7 +45,11 @@ bool getRGBAFromStageSurface(filter_data *tf, uint32_t &width, uint32_t &height)
 		 100.0f);
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-	obs_source_video_render(target);
+	if (parent) {
+		obs_source_default_render(parent);
+	} else {
+		obs_source_video_render(target);
+	}
 	gs_blend_state_pop();
 	gs_texrender_end(tf->texrender);
 
