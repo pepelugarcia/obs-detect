@@ -493,10 +493,15 @@ void detect_filter_update(void *data, obs_data_t *settings)
 		tf->trackingEnabled = newTrackingEnabled;
 		obs_source_t *parent = obs_filter_get_parent(tf->source);
 		if (!parent) {
-			obs_log(LOG_ERROR, "Parent source not found");
-			return;
-		}
-		if (tf->trackingEnabled) {
+			// during scene load this update runs before the filter is
+			// attached to its parent. Returning here would abort the whole
+			// update - including model initialization below - leaving the
+			// filter completely dead until the user re-saves settings.
+			// Defer instead: the video pipeline re-acquires the tracking
+			// crop filter once a parent exists.
+			obs_log(LOG_WARNING,
+				"Parent source not found - deferring tracking filter setup");
+		} else if (tf->trackingEnabled) {
 			obs_log(LOG_DEBUG, "Tracking enabled");
 			// get the parent of the source
 			// check if it has a crop/pad filter
