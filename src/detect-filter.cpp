@@ -1065,6 +1065,21 @@ void detect_filter_video_tick(void *data, float seconds)
 		float zx = boundingBox.x - (zw - boundingBox.width) / 2.0f;
 		float zy = boundingBox.y - (zh - boundingBox.height) / 2.0f;
 
+		// zoom-size deadband: the window height derives from the tracked
+		// box height, so posture changes (crouch, arms up, lean) breathe
+		// the zoom every frame — worst at high zoom factors where the box
+		// passes through at ~zoomFactor gain. While the newly computed size
+		// stays within 8% of the current one, HOLD the current size and
+		// only re-center on the target; size changes only follow genuine
+		// distance changes.
+		if (tf->trackingRect.height > 1.0f && !lostTracking &&
+		    std::fabs(zh - tf->trackingRect.height) < tf->trackingRect.height * 0.08f) {
+			zw = tf->trackingRect.width;
+			zh = tf->trackingRect.height;
+			zx = boundingBox.x - (zw - boundingBox.width) / 2.0f;
+			zy = boundingBox.y - (zh - boundingBox.height) / 2.0f;
+		}
+
 		// keep the zooming box inside the frame: when the target is near an
 		// edge, slide the box to hug that edge instead of centering the
 		// target and padding the out-of-frame area with black
@@ -1077,16 +1092,17 @@ void detect_filter_video_tick(void *data, float seconds)
 			// initialize the trackingRect
 			tf->trackingRect = cv::Rect2f(zx, zy, zw, zh);
 		} else {
-			// interpolate the zooming box to tf->trackingRect
-			float factor = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
-			tf->trackingRect.x =
-				tf->trackingRect.x + factor * (zx - tf->trackingRect.x);
-			tf->trackingRect.y =
-				tf->trackingRect.y + factor * (zy - tf->trackingRect.y);
+			// split smoothing: POSITION follows at the configured speed so
+			// fast action stays framed; SIZE adapts 4x slower so the zoom
+			// glides instead of pumping
+			float posF = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
+			float sizeF = posF * 0.25f;
+			tf->trackingRect.x = tf->trackingRect.x + posF * (zx - tf->trackingRect.x);
+			tf->trackingRect.y = tf->trackingRect.y + posF * (zy - tf->trackingRect.y);
 			tf->trackingRect.width =
-				tf->trackingRect.width + factor * (zw - tf->trackingRect.width);
+				tf->trackingRect.width + sizeF * (zw - tf->trackingRect.width);
 			tf->trackingRect.height =
-				tf->trackingRect.height + factor * (zh - tf->trackingRect.height);
+				tf->trackingRect.height + sizeF * (zh - tf->trackingRect.height);
 		}
 
 		// clamp the smoothed rect in raw space, with the same implosion
