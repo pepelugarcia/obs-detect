@@ -1062,47 +1062,47 @@ void detect_filter_video_tick(void *data, float seconds)
 		// hard floor: the zoom window can never implode, whatever happens
 		zh = std::max(zh, (float)rawH * 0.15f);
 		float zw = zh * frameAspectRatio;
-		float zx = boundingBox.x - (zw - boundingBox.width) / 2.0f;
-		float zy = boundingBox.y - (zh - boundingBox.height) / 2.0f;
-
-		// zoom-size deadband: the window height derives from the tracked
-		// box height, so posture changes (crouch, arms up, lean) breathe
-		// the zoom every frame — worst at high zoom factors where the box
-		// passes through at ~zoomFactor gain. While the newly computed size
-		// stays within 8% of the current one, HOLD the current size and
-		// only re-center on the target; size changes only follow genuine
-		// distance changes.
-		if (tf->trackingRect.height > 1.0f && !lostTracking &&
-		    std::fabs(zh - tf->trackingRect.height) < tf->trackingRect.height * 0.08f) {
-			zw = tf->trackingRect.width;
-			zh = tf->trackingRect.height;
-			zx = boundingBox.x - (zw - boundingBox.width) / 2.0f;
-			zy = boundingBox.y - (zh - boundingBox.height) / 2.0f;
-		}
-
-		// keep the zooming box inside the frame: when the target is near an
-		// edge, slide the box to hug that edge instead of centering the
-		// target and padding the out-of-frame area with black
-		zw = std::min(zw, (float)rawW);
-		zh = std::min(zh, (float)rawH);
-		zx = std::max(0.0f, std::min(zx, (float)rawW - zw));
-		zy = std::max(0.0f, std::min(zy, (float)rawH - zh));
 
 		if (tf->trackingRect.width == 0) {
-			// initialize the trackingRect
-			tf->trackingRect = cv::Rect2f(zx, zy, zw, zh);
+			// initialize the trackingRect centered on the target
+			float zx0 = boundingBox.x - (zw - boundingBox.width) / 2.0f;
+			float zy0 = boundingBox.y - (zh - boundingBox.height) / 2.0f;
+			zw = std::min(zw, (float)rawW);
+			zh = std::min(zh, (float)rawH);
+			zx0 = std::max(0.0f, std::min(zx0, (float)rawW - zw));
+			zy0 = std::max(0.0f, std::min(zy0, (float)rawH - zh));
+			tf->trackingRect = cv::Rect2f(zx0, zy0, zw, zh);
 		} else {
-			// split smoothing: POSITION follows at the configured speed so
-			// fast action stays framed; SIZE adapts 4x slower so the zoom
-			// glides instead of pumping
+			// PAN and ZOOM are fully independent axes (camera-operator
+			// model). Coupling them — or switching between size branches
+			// (the 0.0.10 deadband) — makes the position target jump when
+			// the size target changes, which reads as shake.
 			float posF = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
 			float sizeF = posF * 0.25f;
-			tf->trackingRect.x = tf->trackingRect.x + posF * (zx - tf->trackingRect.x);
-			tf->trackingRect.y = tf->trackingRect.y + posF * (zy - tf->trackingRect.y);
-			tf->trackingRect.width =
-				tf->trackingRect.width + sizeF * (zw - tf->trackingRect.width);
-			tf->trackingRect.height =
-				tf->trackingRect.height + sizeF * (zh - tf->trackingRect.height);
+
+			// SIZE: soft deadband — ignore the first 8% of size error
+			// entirely (posture noise), follow anything beyond it at
+			// quarter speed. Continuous in the input: no branch, no dither.
+			float sizeErr = zh - tf->trackingRect.height;
+			float dead = tf->trackingRect.height * 0.08f;
+			if (sizeErr > dead) sizeErr -= dead;
+			else if (sizeErr < -dead) sizeErr += dead;
+			else sizeErr = 0.0f;
+			tf->trackingRect.height += sizeF * sizeErr;
+			tf->trackingRect.width = tf->trackingRect.height * frameAspectRatio;
+
+			// POSITION: center the CURRENT window on the target's center —
+			// the target never depends on the size math, so size noise
+			// cannot shake the pan
+			float cx = boundingBox.x + boundingBox.width * 0.5f;
+			float cy = boundingBox.y + boundingBox.height * 0.5f;
+			float tx = cx - tf->trackingRect.width * 0.5f;
+			float ty = cy - tf->trackingRect.height * 0.5f;
+			// hug frame edges instead of padding out-of-frame black
+			tx = std::max(0.0f, std::min(tx, (float)rawW - tf->trackingRect.width));
+			ty = std::max(0.0f, std::min(ty, (float)rawH - tf->trackingRect.height));
+			tf->trackingRect.x += posF * (tx - tf->trackingRect.x);
+			tf->trackingRect.y += posF * (ty - tf->trackingRect.y);
 		}
 
 		// clamp the smoothed rect in raw space, with the same implosion
