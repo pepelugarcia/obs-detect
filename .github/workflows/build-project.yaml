@@ -73,6 +73,11 @@ jobs:
 
   macos-build:
     name: Build for macOS 🍏
+    # disabled on this fork (2026-07-10): macos-13 runners never get picked up,
+    # so this job queued forever and - via push.yaml's per-branch concurrency
+    # group - every later push queued behind the zombie run until manually
+    # cancelled. We only consume the Windows artifact.
+    if: false
     runs-on: macos-13
     needs: check-event
     defaults:
