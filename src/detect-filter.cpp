@@ -1123,9 +1123,12 @@ void detect_filter_video_tick(void *data, float seconds)
 			// zoom-speed rate. Continuous in the input: no branch, no dither.
 			float sizeErr = zh - tf->trackingRect.height;
 			float dead = tf->trackingRect.height * 0.08f;
-			if (sizeErr > dead) sizeErr -= dead;
-			else if (sizeErr < -dead) sizeErr += dead;
-			else sizeErr = 0.0f;
+			if (sizeErr > dead)
+				sizeErr -= dead;
+			else if (sizeErr < -dead)
+				sizeErr += dead;
+			else
+				sizeErr = 0.0f;
 			tf->trackingRect.height += (sizeErr > 0.0f ? sizeOutF : sizeInF) * sizeErr;
 			tf->trackingRect.width = tf->trackingRect.height * frameAspectRatio;
 
@@ -1149,11 +1152,10 @@ void detect_filter_video_tick(void *data, float seconds)
 						  (float)rawW * 0.15f);
 		tf->trackingRect.height = std::max(std::min(tf->trackingRect.height, (float)rawH),
 						   (float)rawH * 0.15f);
-		tf->trackingRect.x = std::max(
-			0.0f, std::min(tf->trackingRect.x, (float)rawW - tf->trackingRect.width));
+		tf->trackingRect.x = std::max(0.0f, std::min(tf->trackingRect.x,
+							     (float)rawW - tf->trackingRect.width));
 		tf->trackingRect.y = std::max(
-			0.0f,
-			std::min(tf->trackingRect.y, (float)rawH - tf->trackingRect.height));
+			0.0f, std::min(tf->trackingRect.y, (float)rawH - tf->trackingRect.height));
 
 		// apply to the crop/pad filter (values are raw-frame pixels)
 		obs_data_t *crop_pad_settings = obs_source_get_settings(tf->trackingFilter);
@@ -1175,9 +1177,9 @@ void detect_filter_video_tick(void *data, float seconds)
 			obs_log(LOG_INFO,
 				"[detect-diag] '%s' captured %dx%d %s box %.0fx%.0f rect %.0f,%.0f %.0fx%.0f",
 				obs_source_get_name(obs_filter_get_parent(tf->source)), rawW, rawH,
-				lostTracking ? "lost" : "live", boundingBox.width, boundingBox.height,
-				tf->trackingRect.x, tf->trackingRect.y, tf->trackingRect.width,
-				tf->trackingRect.height);
+				lostTracking ? "lost" : "live", boundingBox.width,
+				boundingBox.height, tf->trackingRect.x, tf->trackingRect.y,
+				tf->trackingRect.width, tf->trackingRect.height);
 		}
 	}
 }
