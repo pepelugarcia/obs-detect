@@ -236,7 +236,8 @@ obs_properties_t *detect_filter_properties(void *data)
 							      obs_property_t *,
 							      obs_data_t *settings) {
 		const bool enabled = obs_data_get_bool(settings, "tracking_group");
-		for (auto prop_name : {"zoom_factor", "zoom_object", "zoom_speed_factor"}) {
+		for (auto prop_name : {"zoom_factor", "zoom_object", "zoom_speed_factor",
+				       "zoom_size_speed_factor"}) {
 			obs_property_t *prop = obs_properties_get(props_, prop_name);
 			obs_property_set_visible(prop, enabled);
 		}
@@ -247,8 +248,13 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_properties_add_float_slider(tracking_group_props, "zoom_factor",
 					obs_module_text("ZoomFactor"), 0.0, 1.0, 0.05);
 
+	// PAN/track speed: how fast the crop re-centers on the actor
 	obs_properties_add_float_slider(tracking_group_props, "zoom_speed_factor",
 					obs_module_text("ZoomSpeed"), 0.0, 0.1, 0.01);
+
+	// SIZE/zoom speed: how fast the crop tightens/widens (independent of pan)
+	obs_properties_add_float_slider(tracking_group_props, "zoom_size_speed_factor",
+					obs_module_text("ZoomSizeSpeed"), 0.0, 0.05, 0.0025);
 
 	// add object selection for zoom drop down: "Single", "All"
 	obs_property_t *zoom_object = obs_properties_add_list(tracking_group_props, "zoom_object",
@@ -447,6 +453,8 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "tracking_group", false);
 	obs_data_set_default_double(settings, "zoom_factor", 0.0);
 	obs_data_set_default_double(settings, "zoom_speed_factor", 0.05);
+	// default = old coupled behaviour (0.05 pan x 0.25) so the baseline feel is preserved
+	obs_data_set_default_double(settings, "zoom_size_speed_factor", 0.0125);
 	obs_data_set_default_string(settings, "zoom_object", "single");
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
@@ -475,6 +483,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	bool newTrackingEnabled = obs_data_get_bool(settings, "tracking_group");
 	tf->zoomFactor = (float)obs_data_get_double(settings, "zoom_factor");
 	tf->zoomSpeedFactor = (float)obs_data_get_double(settings, "zoom_speed_factor");
+	tf->zoomSizeSpeedFactor = (float)obs_data_get_double(settings, "zoom_size_speed_factor");
 	tf->zoomObject = obs_data_get_string(settings, "zoom_object");
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
@@ -1074,15 +1083,17 @@ void detect_filter_video_tick(void *data, float seconds)
 			tf->trackingRect = cv::Rect2f(zx0, zy0, zw, zh);
 		} else {
 			// PAN and ZOOM are fully independent axes (camera-operator
-			// model). Coupling them — or switching between size branches
-			// (the 0.0.10 deadband) — makes the position target jump when
-			// the size target changes, which reads as shake.
+			// model), each with its OWN smoothing speed. Coupling them —
+			// or switching between size branches (the 0.0.10 deadband) —
+			// makes the position target jump when the size target changes,
+			// which reads as shake. Track speed drives pan; zoom (size)
+			// speed drives resize. Both slow to 0.2x while re-acquiring.
 			float posF = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
-			float sizeF = posF * 0.25f;
+			float sizeF = tf->zoomSizeSpeedFactor * (lostTracking ? 0.2f : 1.0f);
 
 			// SIZE: soft deadband — ignore the first 8% of size error
-			// entirely (posture noise), follow anything beyond it at
-			// quarter speed. Continuous in the input: no branch, no dither.
+			// entirely (posture noise), follow anything beyond it at the
+			// zoom-speed rate. Continuous in the input: no branch, no dither.
 			float sizeErr = zh - tf->trackingRect.height;
 			float dead = tf->trackingRect.height * 0.08f;
 			if (sizeErr > dead) sizeErr -= dead;

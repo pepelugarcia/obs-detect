@@ -26,7 +26,8 @@ struct filter_data {
 	int maskingDilateIterations;
 	bool trackingEnabled;
 	float zoomFactor;
-	float zoomSpeedFactor;
+	float zoomSpeedFactor;     // PAN/track responsiveness (how fast the crop re-centers)
+	float zoomSizeSpeedFactor; // SIZE/zoom responsiveness (how fast the crop resizes)
 	std::string zoomObject;
 	obs_source_t *trackingFilter;
 	cv::Rect2f trackingRect;
