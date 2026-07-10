@@ -744,6 +744,8 @@ void *detect_filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->source = source;
 	tf->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
 	tf->lastDetectedObjectId = -1;
+	tf->boxHeightHistN = 0;
+	tf->boxHeightHistIdx = 0;
 
 	std::vector<std::tuple<const char *, gs_effect_t **>> effects = {
 		{KAWASE_BLUR_EFFECT_PATH, &tf->kawaseBlurEffect},
@@ -1065,6 +1067,24 @@ void detect_filter_video_tick(void *data, float seconds)
 		// tf->zoomFactor controlling the buffer around the bounding box
 		float frameAspectRatio = (float)rawW / (float)rawH;
 		float boxHeight = std::min(boundingBox.height, (float)rawH);
+		// median-of-5 on the target height: single-frame detection spikes and
+		// brief identity switches must not move the zoom target. History
+		// resets while lost, so re-acquire starts fresh (lost path itself
+		// keeps the raw full-frame height and is unaffected).
+		if (lostTracking) {
+			tf->boxHeightHistN = 0;
+			tf->boxHeightHistIdx = 0;
+		} else {
+			tf->boxHeightHist[tf->boxHeightHistIdx] = boxHeight;
+			tf->boxHeightHistIdx = (tf->boxHeightHistIdx + 1) % 5;
+			if (tf->boxHeightHistN < 5)
+				tf->boxHeightHistN++;
+			float sortedHeights[5];
+			std::copy(tf->boxHeightHist, tf->boxHeightHist + tf->boxHeightHistN,
+				  sortedHeights);
+			std::sort(sortedHeights, sortedHeights + tf->boxHeightHistN);
+			boxHeight = sortedHeights[tf->boxHeightHistN / 2];
+		}
 		float dh = (float)rawH - boxHeight;
 		float buffer = dh * (1.0f - tf->zoomFactor);
 		float zh = boxHeight + buffer;
@@ -1089,7 +1109,13 @@ void detect_filter_video_tick(void *data, float seconds)
 			// which reads as shake. Track speed drives pan; zoom (size)
 			// speed drives resize. Both slow to 0.2x while re-acquiring.
 			float posF = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
-			float sizeF = tf->zoomSizeSpeedFactor * (lostTracking ? 0.2f : 1.0f);
+			// ASYMMETRIC zoom (broadcast auto-framing behaviour): widening
+			// (actor grew / came closer — protective) runs at 4x the slider
+			// rate; tightening creeps at the slider rate. Pumping cannot
+			// sustain when one direction crawls: the window parks near the
+			// recent maximum and only slowly creeps back in.
+			float sizeInF = tf->zoomSizeSpeedFactor * (lostTracking ? 0.2f : 1.0f);
+			float sizeOutF = std::min(sizeInF * 4.0f, 0.06f);
 
 			// SIZE: soft deadband — ignore the first 8% of size error
 			// entirely (posture noise), follow anything beyond it at the
@@ -1099,7 +1125,7 @@ void detect_filter_video_tick(void *data, float seconds)
 			if (sizeErr > dead) sizeErr -= dead;
 			else if (sizeErr < -dead) sizeErr += dead;
 			else sizeErr = 0.0f;
-			tf->trackingRect.height += sizeF * sizeErr;
+			tf->trackingRect.height += (sizeErr > 0.0f ? sizeOutF : sizeInF) * sizeErr;
 			tf->trackingRect.width = tf->trackingRect.height * frameAspectRatio;
 
 			// POSITION: center the CURRENT window on the target's center —

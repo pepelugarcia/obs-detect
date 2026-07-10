@@ -28,6 +28,9 @@ struct filter_data {
 	float zoomFactor;
 	float zoomSpeedFactor;     // PAN/track responsiveness (how fast the crop re-centers)
 	float zoomSizeSpeedFactor; // SIZE/zoom responsiveness (how fast the crop resizes)
+	float boxHeightHist[5];    // rolling target-height window for the median filter
+	int boxHeightHistN;        // valid entries (reset while tracking is lost)
+	int boxHeightHistIdx;
 	std::string zoomObject;
 	obs_source_t *trackingFilter;
 	cv::Rect2f trackingRect;
