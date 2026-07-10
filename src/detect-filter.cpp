@@ -254,7 +254,7 @@ obs_properties_t *detect_filter_properties(void *data)
 
 	// SIZE/zoom speed: how fast the crop tightens/widens (independent of pan)
 	obs_properties_add_float_slider(tracking_group_props, "zoom_size_speed_factor",
-					obs_module_text("ZoomSizeSpeed"), 0.0, 0.05, 0.0025);
+					obs_module_text("ZoomSizeSpeed"), 0.0, 0.05, 0.001);
 
 	// add object selection for zoom drop down: "Single", "All"
 	obs_property_t *zoom_object = obs_properties_add_list(tracking_group_props, "zoom_object",
@@ -453,8 +453,9 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "tracking_group", false);
 	obs_data_set_default_double(settings, "zoom_factor", 0.0);
 	obs_data_set_default_double(settings, "zoom_speed_factor", 0.05);
-	// default = old coupled behaviour (0.05 pan x 0.25) so the baseline feel is preserved
-	obs_data_set_default_double(settings, "zoom_size_speed_factor", 0.0125);
+	// studio default, operator-tuned on the floor 2026-07-10 (with the
+	// asymmetric widen-4x behaviour this is the TIGHTEN rate)
+	obs_data_set_default_double(settings, "zoom_size_speed_factor", 0.022);
 	obs_data_set_default_string(settings, "zoom_object", "single");
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
