@@ -31,6 +31,8 @@ struct filter_data {
 	float boxHeightHist[5];    // rolling target-height window for the median filter
 	int boxHeightHistN;        // valid entries (reset while tracking is lost)
 	int boxHeightHistIdx;
+	int64_t lockedTrackId; // director lock: SORT track id to follow (0 = automatic)
+	int tracksReportTick;  // throttle for publishing tracks_json into settings
 	std::string zoomObject;
 	obs_source_t *trackingFilter;
 	cv::Rect2f trackingRect;

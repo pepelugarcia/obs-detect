@@ -10,6 +10,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <atomic>
 #include <numeric>
@@ -457,6 +458,9 @@ void detect_filter_defaults(obs_data_t *settings)
 	// asymmetric widen-4x behaviour this is the TIGHTEN rate)
 	obs_data_set_default_double(settings, "zoom_size_speed_factor", 0.022);
 	obs_data_set_default_string(settings, "zoom_object", "single");
+	// director lock: SORT track id to follow exclusively (0 = automatic).
+	// set from the control panel; deliberately not exposed in the OBS UI
+	obs_data_set_default_int(settings, "locked_track_id", 0);
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
 	obs_data_set_default_int(settings, "crop_left", 0);
@@ -486,6 +490,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	tf->zoomSpeedFactor = (float)obs_data_get_double(settings, "zoom_speed_factor");
 	tf->zoomSizeSpeedFactor = (float)obs_data_get_double(settings, "zoom_size_speed_factor");
 	tf->zoomObject = obs_data_get_string(settings, "zoom_object");
+	tf->lockedTrackId = obs_data_get_int(settings, "locked_track_id");
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
 	if (tf->tracker.getMaxUnseenFrames() != maxUnseenFrames) {
@@ -747,6 +752,8 @@ void *detect_filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->lastDetectedObjectId = -1;
 	tf->boxHeightHistN = 0;
 	tf->boxHeightHistIdx = 0;
+	tf->lockedTrackId = 0;
+	tf->tracksReportTick = 0;
 
 	std::vector<std::tuple<const char *, gs_effect_t **>> effects = {
 		{KAWASE_BLUR_EFFECT_PATH, &tf->kawaseBlurEffect},
@@ -1005,45 +1012,60 @@ void detect_filter_video_tick(void *data, float seconds)
 		// without corrections)
 		bool found = false;
 		cv::Rect2f targetBox;
-		if (tf->zoomObject == "single") {
+		// DIRECTOR LOCK: a specific tracker identity picked from the panel
+		// wins over every automatic mode, so crowded floors cannot steal the
+		// frame. The automatic mode below only runs while the locked identity
+		// is not currently visible (occluded or gone).
+		if (tf->lockedTrackId > 0) {
 			for (const Object &obj : objects) {
-				if (obj.unseenFrames == 0) {
+				if ((int64_t)obj.id == tf->lockedTrackId && obj.unseenFrames == 0) {
 					targetBox = obj.rect;
 					found = true;
 					break;
 				}
 			}
-		} else if (tf->zoomObject == "biggest") {
-			float maxArea = 0;
-			for (const Object &obj : objects) {
-				if (obj.unseenFrames > 0)
-					continue;
-				const float area = obj.rect.width * obj.rect.height;
-				if (area > maxArea) {
-					maxArea = area;
-					targetBox = obj.rect;
-					found = true;
+		}
+		if (!found) {
+			if (tf->zoomObject == "single") {
+				for (const Object &obj : objects) {
+					if (obj.unseenFrames == 0) {
+						targetBox = obj.rect;
+						found = true;
+						break;
+					}
 				}
-			}
-		} else if (tf->zoomObject == "oldest") {
-			uint64_t oldestId = UINT64_MAX;
-			for (const Object &obj : objects) {
-				if (obj.unseenFrames == 0 && obj.id < oldestId) {
-					oldestId = obj.id;
-					targetBox = obj.rect;
-					found = true;
+			} else if (tf->zoomObject == "biggest") {
+				float maxArea = 0;
+				for (const Object &obj : objects) {
+					if (obj.unseenFrames > 0)
+						continue;
+					const float area = obj.rect.width * obj.rect.height;
+					if (area > maxArea) {
+						maxArea = area;
+						targetBox = obj.rect;
+						found = true;
+					}
 				}
-			}
-		} else {
-			// bounding box of all currently visible objects
-			for (const Object &obj : objects) {
-				if (obj.unseenFrames > 0)
-					continue;
-				if (!found) {
-					targetBox = obj.rect;
-					found = true;
-				} else {
-					targetBox |= obj.rect;
+			} else if (tf->zoomObject == "oldest") {
+				uint64_t oldestId = UINT64_MAX;
+				for (const Object &obj : objects) {
+					if (obj.unseenFrames == 0 && obj.id < oldestId) {
+						oldestId = obj.id;
+						targetBox = obj.rect;
+						found = true;
+					}
+				}
+			} else {
+				// bounding box of all currently visible objects
+				for (const Object &obj : objects) {
+					if (obj.unseenFrames > 0)
+						continue;
+					if (!found) {
+						targetBox = obj.rect;
+						found = true;
+					} else {
+						targetBox |= obj.rect;
+					}
 				}
 			}
 		}
@@ -1063,6 +1085,41 @@ void detect_filter_video_tick(void *data, float seconds)
 			boundingBox = cv::Rect2f(0, 0, (float)rawW, (float)rawH);
 		}
 		bool lostTracking = !found;
+
+		// publish the currently visible tracks and the lock state into the
+		// filter's settings a few times a second. The control panel reads
+		// them with GetSourceFilter and renders a click-to-lock picker -
+		// same reporting channel the "error" key already uses. Coordinates
+		// are normalized to the raw frame.
+		if (++tf->tracksReportTick >= 15) {
+			tf->tracksReportTick = 0;
+			std::string tj = "[";
+			bool firstTrack = true;
+			bool lockVisible = false;
+			for (const Object &obj : objects) {
+				if (obj.unseenFrames > 0)
+					continue;
+				if ((int64_t)obj.id == tf->lockedTrackId)
+					lockVisible = true;
+				char buf[160];
+				snprintf(
+					buf, sizeof(buf),
+					"%s{\"id\":%llu,\"x\":%.3f,\"y\":%.3f,\"w\":%.3f,\"h\":%.3f}",
+					firstTrack ? "" : ",", (unsigned long long)obj.id,
+					obj.rect.x / (float)rawW, obj.rect.y / (float)rawH,
+					obj.rect.width / (float)rawW,
+					obj.rect.height / (float)rawH);
+				firstTrack = false;
+				tj += buf;
+			}
+			tj += "]";
+			obs_data_t *st = obs_source_get_settings(tf->source);
+			obs_data_set_string(st, "tracks_json", tj.c_str());
+			obs_data_set_string(
+				st, "lock_status",
+				tf->lockedTrackId > 0 ? (lockVisible ? "locked" : "lost") : "off");
+			obs_data_release(st);
+		}
 
 		// the zooming box maintains the raw frame's aspect ratio, with
 		// tf->zoomFactor controlling the buffer around the bounding box
