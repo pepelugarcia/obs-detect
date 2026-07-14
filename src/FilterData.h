@@ -31,8 +31,13 @@ struct filter_data {
 	float boxHeightHist[5];    // rolling target-height window for the median filter
 	int boxHeightHistN;        // valid entries (reset while tracking is lost)
 	int boxHeightHistIdx;
-	int64_t lockedTrackId; // director lock: SORT track id to follow (0 = automatic)
-	int tracksReportTick;  // throttle for publishing tracks_json into settings
+	int64_t lockedTrackId;   // director lock: SORT track id to follow (0 = automatic)
+	int tracksReportTick;    // throttle for publishing tracks_json into settings
+	bool lockAutoRelock;     // v2: re-attach a dead lock to the nearest newcomer
+	cv::Rect2f lockLastRect; // where the locked person was last seen visible
+	bool lockLastValid;
+	int lockDeathTicks;                     // ticks since the locked track vanished entirely
+	std::vector<uint64_t> lockAliveAtDeath; // ids visible at death = never candidates
 	std::string zoomObject;
 	obs_source_t *trackingFilter;
 	cv::Rect2f trackingRect;

@@ -461,6 +461,7 @@ void detect_filter_defaults(obs_data_t *settings)
 	// director lock: SORT track id to follow exclusively (0 = automatic).
 	// set from the control panel; deliberately not exposed in the OBS UI
 	obs_data_set_default_int(settings, "locked_track_id", 0);
+	obs_data_set_default_bool(settings, "lock_auto_relock", true);
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
 	obs_data_set_default_int(settings, "crop_left", 0);
@@ -491,6 +492,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	tf->zoomSizeSpeedFactor = (float)obs_data_get_double(settings, "zoom_size_speed_factor");
 	tf->zoomObject = obs_data_get_string(settings, "zoom_object");
 	tf->lockedTrackId = obs_data_get_int(settings, "locked_track_id");
+	tf->lockAutoRelock = obs_data_get_bool(settings, "lock_auto_relock");
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
 	if (tf->tracker.getMaxUnseenFrames() != maxUnseenFrames) {
@@ -754,6 +756,9 @@ void *detect_filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->boxHeightHistIdx = 0;
 	tf->lockedTrackId = 0;
 	tf->tracksReportTick = 0;
+	tf->lockAutoRelock = true;
+	tf->lockLastValid = false;
+	tf->lockDeathTicks = 0;
 
 	std::vector<std::tuple<const char *, gs_effect_t **>> effects = {
 		{KAWASE_BLUR_EFFECT_PATH, &tf->kawaseBlurEffect},
@@ -1016,6 +1021,86 @@ void detect_filter_video_tick(void *data, float seconds)
 		// wins over every automatic mode, so crowded floors cannot steal the
 		// frame. The automatic mode below only runs while the locked identity
 		// is not currently visible (occluded or gone).
+		// DIRECTOR LOCK v2 - auto-relock. While the locked person is
+		// visible, remember where they were. If their track dies entirely
+		// (occlusion beyond max_unseen), watch for up to ~4 s for a NEW
+		// track appearing near that spot with a similar size and transfer
+		// the lock to it. People already visible at the moment of death
+		// (the occluder) are never candidates.
+		if (tf->lockedTrackId > 0) {
+			bool lockedPresent = false;
+			for (const Object &obj : objects) {
+				if ((int64_t)obj.id + 1 == tf->lockedTrackId) {
+					lockedPresent = true;
+					if (obj.unseenFrames == 0) {
+						tf->lockLastRect = obj.rect;
+						tf->lockLastValid = true;
+					}
+					break;
+				}
+			}
+			if (lockedPresent) {
+				tf->lockDeathTicks = 0;
+				tf->lockAliveAtDeath.clear();
+			} else if (tf->lockLastValid) {
+				if (tf->lockDeathTicks == 0) {
+					tf->lockAliveAtDeath.clear();
+					for (const Object &obj : objects)
+						tf->lockAliveAtDeath.push_back(obj.id);
+				}
+				tf->lockDeathTicks++;
+				if (tf->lockAutoRelock && tf->lockDeathTicks <= 240) {
+					float cx =
+						tf->lockLastRect.x + tf->lockLastRect.width * 0.5f;
+					float cy =
+						tf->lockLastRect.y + tf->lockLastRect.height * 0.5f;
+					float bestDist = (float)rawW * 0.25f;
+					int64_t bestId = 0;
+					cv::Rect2f bestRect;
+					for (const Object &obj : objects) {
+						if (obj.unseenFrames > 0)
+							continue;
+						bool wasAlive = false;
+						for (size_t ai = 0;
+						     ai < tf->lockAliveAtDeath.size(); ai++) {
+							if (tf->lockAliveAtDeath[ai] == obj.id) {
+								wasAlive = true;
+								break;
+							}
+						}
+						if (wasAlive)
+							continue;
+						float hr = obj.rect.height /
+							   std::max(1.0f, tf->lockLastRect.height);
+						if (hr < 0.5f || hr > 2.0f)
+							continue;
+						float ox = obj.rect.x + obj.rect.width * 0.5f;
+						float oy = obj.rect.y + obj.rect.height * 0.5f;
+						float d = std::hypot(ox - cx, oy - cy);
+						if (d < bestDist) {
+							bestDist = d;
+							bestId = (int64_t)obj.id + 1;
+							bestRect = obj.rect;
+						}
+					}
+					if (bestId > 0) {
+						obs_log(LOG_INFO,
+							"director lock re-attached %lld -> %lld",
+							(long long)tf->lockedTrackId,
+							(long long)bestId);
+						tf->lockedTrackId = bestId;
+						tf->lockLastRect = bestRect;
+						tf->lockDeathTicks = 0;
+						tf->lockAliveAtDeath.clear();
+						obs_data_t *st =
+							obs_source_get_settings(tf->source);
+						obs_data_set_int(st, "locked_track_id", bestId);
+						obs_data_release(st);
+					}
+				}
+			}
+		}
+
 		// NOTE: locked_track_id carries SORT id + 1, because SORT ids start
 		// at 0 and 0 must keep meaning "automatic" (the very first track of
 		// a session would otherwise be unlockable)
