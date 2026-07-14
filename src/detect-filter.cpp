@@ -1016,9 +1016,13 @@ void detect_filter_video_tick(void *data, float seconds)
 		// wins over every automatic mode, so crowded floors cannot steal the
 		// frame. The automatic mode below only runs while the locked identity
 		// is not currently visible (occluded or gone).
+		// NOTE: locked_track_id carries SORT id + 1, because SORT ids start
+		// at 0 and 0 must keep meaning "automatic" (the very first track of
+		// a session would otherwise be unlockable)
 		if (tf->lockedTrackId > 0) {
 			for (const Object &obj : objects) {
-				if ((int64_t)obj.id == tf->lockedTrackId && obj.unseenFrames == 0) {
+				if ((int64_t)obj.id + 1 == tf->lockedTrackId &&
+				    obj.unseenFrames == 0) {
 					targetBox = obj.rect;
 					found = true;
 					break;
@@ -1099,13 +1103,13 @@ void detect_filter_video_tick(void *data, float seconds)
 			for (const Object &obj : objects) {
 				if (obj.unseenFrames > 0)
 					continue;
-				if ((int64_t)obj.id == tf->lockedTrackId)
+				if ((int64_t)obj.id + 1 == tf->lockedTrackId)
 					lockVisible = true;
 				char buf[160];
 				snprintf(
 					buf, sizeof(buf),
 					"%s{\"id\":%llu,\"x\":%.3f,\"y\":%.3f,\"w\":%.3f,\"h\":%.3f}",
-					firstTrack ? "" : ",", (unsigned long long)obj.id,
+					firstTrack ? "" : ",", (unsigned long long)(obj.id + 1),
 					obj.rect.x / (float)rawW, obj.rect.y / (float)rawH,
 					obj.rect.width / (float)rawW,
 					obj.rect.height / (float)rawH);
