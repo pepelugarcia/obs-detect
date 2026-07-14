@@ -759,6 +759,8 @@ void *detect_filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->lockAutoRelock = true;
 	tf->lockLastValid = false;
 	tf->lockDeathTicks = 0;
+	tf->sizeEnv = 0.0f;
+	tf->sizeEnvSmallTicks = 0;
 
 	std::vector<std::tuple<const char *, gs_effect_t **>> effects = {
 		{KAWASE_BLUR_EFFECT_PATH, &tf->kawaseBlurEffect},
@@ -1231,6 +1233,27 @@ void detect_filter_video_tick(void *data, float seconds)
 				  sortedHeights);
 			std::sort(sortedHeights, sortedHeights + tf->boxHeightHistN);
 			boxHeight = sortedHeights[tf->boxHeightHistN / 2];
+		}
+		// POSTURE HOLD: crouches and aims must not pump the frame. Track a
+		// rising-max envelope of the target height: it rises instantly with
+		// the target, but only decays toward a smaller target after the
+		// target has stayed smaller for a ~2 s grace period. Posture dips
+		// shorter than the grace leave the frame perfectly still; a real
+		// retreat starts re-framing right after the grace.
+		if (lostTracking) {
+			tf->sizeEnv = 0.0f;
+			tf->sizeEnvSmallTicks = 0;
+		} else {
+			if (boxHeight >= tf->sizeEnv) {
+				tf->sizeEnv = boxHeight;
+				tf->sizeEnvSmallTicks = 0;
+			} else {
+				tf->sizeEnvSmallTicks++;
+				if (tf->sizeEnvSmallTicks > 120)
+					tf->sizeEnv += std::max(tf->zoomSizeSpeedFactor, 0.005f) *
+						       (boxHeight - tf->sizeEnv);
+			}
+			boxHeight = tf->sizeEnv;
 		}
 		float dh = (float)rawH - boxHeight;
 		float buffer = dh * (1.0f - tf->zoomFactor);
