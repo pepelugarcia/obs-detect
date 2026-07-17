@@ -462,6 +462,10 @@ void detect_filter_defaults(obs_data_t *settings)
 	// set from the control panel; deliberately not exposed in the OBS UI
 	obs_data_set_default_int(settings, "locked_track_id", 0);
 	obs_data_set_default_bool(settings, "lock_auto_relock", true);
+	// frame-skip: readback+inference every Nth rendered frame (1 = every frame).
+	// 3x4K readbacks per frame stall the render thread; 3 gives ~10Hz tracking
+	// while video passes through at full fps
+	obs_data_set_default_int(settings, "detect_interval", 3);
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
 	obs_data_set_default_int(settings, "crop_left", 0);
@@ -493,6 +497,10 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	tf->zoomObject = obs_data_get_string(settings, "zoom_object");
 	tf->lockedTrackId = obs_data_get_int(settings, "locked_track_id");
 	tf->lockAutoRelock = obs_data_get_bool(settings, "lock_auto_relock");
+	{
+		int di = (int)obs_data_get_int(settings, "detect_interval");
+		tf->detectInterval = di < 1 ? 1 : (di > 10 ? 10 : di);
+	}
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
 	if (tf->tracker.getMaxUnseenFrames() != maxUnseenFrames) {
@@ -759,8 +767,9 @@ void *detect_filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->lockAutoRelock = true;
 	tf->lockLastValid = false;
 	tf->lockDeathTicks = 0;
-	tf->sizeEnv = 0.0f;
-	tf->sizeEnvSmallTicks = 0;
+	tf->detectInterval = 3;
+	tf->renderFrameCount = 0;
+	tf->inputFresh = false;
 
 	std::vector<std::tuple<const char *, gs_effect_t **>> effects = {
 		{KAWASE_BLUR_EFFECT_PATH, &tf->kawaseBlurEffect},
@@ -838,7 +847,15 @@ void detect_filter_video_tick(void *data, float seconds)
 			// No data to process
 			return;
 		}
+		// frame-skip: only run inference+tracking on a genuinely new captured
+		// frame. Between captures the crop filter holds its last values, so
+		// the render thread is spared the readback and the tracker's temporal
+		// state (unseen counts, SORT) is never fed a duplicate frame.
+		if (!tf->inputFresh) {
+			return;
+		}
 		imageBGRA = tf->inputBGRA.clone();
+		tf->inputFresh = false;
 	}
 
 	cv::Mat inferenceFrame;
@@ -1234,27 +1251,6 @@ void detect_filter_video_tick(void *data, float seconds)
 			std::sort(sortedHeights, sortedHeights + tf->boxHeightHistN);
 			boxHeight = sortedHeights[tf->boxHeightHistN / 2];
 		}
-		// POSTURE HOLD: crouches and aims must not pump the frame. Track a
-		// rising-max envelope of the target height: it rises instantly with
-		// the target, but only decays toward a smaller target after the
-		// target has stayed smaller for a ~2 s grace period. Posture dips
-		// shorter than the grace leave the frame perfectly still; a real
-		// retreat starts re-framing right after the grace.
-		if (lostTracking) {
-			tf->sizeEnv = 0.0f;
-			tf->sizeEnvSmallTicks = 0;
-		} else {
-			if (boxHeight >= tf->sizeEnv) {
-				tf->sizeEnv = boxHeight;
-				tf->sizeEnvSmallTicks = 0;
-			} else {
-				tf->sizeEnvSmallTicks++;
-				if (tf->sizeEnvSmallTicks > 120)
-					tf->sizeEnv += std::max(tf->zoomSizeSpeedFactor, 0.005f) *
-						       (boxHeight - tf->sizeEnv);
-			}
-			boxHeight = tf->sizeEnv;
-		}
 		float dh = (float)rawH - boxHeight;
 		float buffer = dh * (1.0f - tf->zoomFactor);
 		float zh = boxHeight + buffer;
@@ -1363,6 +1359,19 @@ void detect_filter_video_render(void *data, gs_effect_t *_effect)
 		if (tf->source) {
 			obs_source_skip_video_filter(tf->source);
 		}
+		return;
+	}
+
+	// FRAME-SKIP: the getRGBAFromStageSurface() readback below is a synchronous
+	// 4K GPU->CPU transfer that stalls the render thread; with 3x4K cameras it
+	// caps OBS at ~20fps while the GPU sits <30% busy. Run it every Nth frame
+	// instead - inference/tracking then update at ~10Hz (ample for human
+	// motion) while every frame passes straight through at full fps. Disabled
+	// when masking is on (that path needs a fresh frame every frame for a
+	// clean output).
+	if (tf->detectInterval > 1 && !tf->maskingEnabled &&
+	    (tf->renderFrameCount++ % tf->detectInterval) != 0) {
+		obs_source_skip_video_filter(tf->source);
 		return;
 	}
 

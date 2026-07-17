@@ -68,6 +68,7 @@ bool getRGBAFromStageSurface(filter_data *tf, uint32_t &width, uint32_t &height)
 	{
 		std::lock_guard<std::mutex> lock(tf->inputBGRALock);
 		tf->inputBGRA = cv::Mat(height, width, CV_8UC4, video_data, linesize);
+		tf->inputFresh = true; // signal video_tick a new frame is ready
 	}
 	gs_stagesurface_unmap(tf->stagesurface);
 	return true;

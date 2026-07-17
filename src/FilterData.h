@@ -31,8 +31,9 @@ struct filter_data {
 	float boxHeightHist[5];    // rolling target-height window for the median filter
 	int boxHeightHistN;        // valid entries (reset while tracking is lost)
 	int boxHeightHistIdx;
-	float sizeEnv;           // posture-hold envelope: decaying max of target height
-	int sizeEnvSmallTicks;   // how long the target has stayed below the envelope
+	int detectInterval;      // run readback+inference every Nth rendered frame (>=1)
+	int renderFrameCount;    // video_render gate counter for frame-skip
+	bool inputFresh;         // a captured frame is waiting for video_tick to consume
 	int64_t lockedTrackId;   // director lock: SORT track id to follow (0 = automatic)
 	int tracksReportTick;    // throttle for publishing tracks_json into settings
 	bool lockAutoRelock;     // v2: re-attach a dead lock to the nearest newcomer
