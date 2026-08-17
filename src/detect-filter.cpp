@@ -314,6 +314,12 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_properties_add_int_slider(props, "min_size_threshold",
 				      obs_module_text("MinSizeThreshold"), 0, 10000, 1);
 
+	/* Detection readback downscale. 1 = read back the full source (old, slow);
+	   3 turns a 4K capture into 1280x720 for ~1/9 the GPU->CPU bytes, which is
+	   what lets detection run EVERY frame without stalling the render thread. */
+	obs_properties_add_int_slider(props, "detect_scale", obs_module_text("DetectScale"), 1, 4,
+				      1);
+
 	// add SORT tracking enabled checkbox
 	obs_properties_add_bool(props, "sort_tracking", obs_module_text("SORTTracking"));
 
@@ -463,9 +469,12 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "locked_track_id", 0);
 	obs_data_set_default_bool(settings, "lock_auto_relock", true);
 	// frame-skip: readback+inference every Nth rendered frame (1 = every frame).
-	// 3x4K readbacks per frame stall the render thread; 3 gives ~10Hz tracking
-	// while video passes through at full fps
-	obs_data_set_default_int(settings, "detect_interval", 3);
+	/* With detect_scale downscaling the readback (~1/9 the bytes at div 3),
+	   every-frame detection is affordable again - and every-frame is what makes
+	   panning smooth: at interval > 1 the crop HOLDS between updates, which
+	   reads as choppy framing even while the output sits at a full 30fps. */
+	obs_data_set_default_int(settings, "detect_interval", 1);
+	obs_data_set_default_int(settings, "detect_scale", 3);
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
 	obs_data_set_default_int(settings, "crop_left", 0);
@@ -500,6 +509,8 @@ void detect_filter_update(void *data, obs_data_t *settings)
 	{
 		int di = (int)obs_data_get_int(settings, "detect_interval");
 		tf->detectInterval = di < 1 ? 1 : (di > 10 ? 10 : di);
+		int ds = (int)obs_data_get_int(settings, "detect_scale");
+		tf->readbackDiv = ds < 1 ? 1 : (ds > 4 ? 4 : ds);
 	}
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
@@ -767,9 +778,14 @@ void *detect_filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->lockAutoRelock = true;
 	tf->lockLastValid = false;
 	tf->lockDeathTicks = 0;
-	tf->detectInterval = 3;
+	tf->detectInterval = 1;
 	tf->renderFrameCount = 0;
 	tf->inputFresh = false;
+	tf->readbackDiv = 3;
+	tf->sourceW = 0;
+	tf->sourceH = 0;
+	tf->readbackScaleX = 1.0f;
+	tf->readbackScaleY = 1.0f;
 
 	std::vector<std::tuple<const char *, gs_effect_t **>> effects = {
 		{KAWASE_BLUR_EFFECT_PATH, &tf->kawaseBlurEffect},
@@ -865,9 +881,16 @@ void detect_filter_video_tick(void *data, float seconds)
 	// out-of-range values instead of trusting them blindly
 	cv::Rect cropRect(0, 0, imageBGRA.cols, imageBGRA.rows);
 	if (tf->crop_enabled) {
-		cv::Rect fence(tf->crop_left, tf->crop_top,
-			       imageBGRA.cols - tf->crop_left - tf->crop_right,
-			       imageBGRA.rows - tf->crop_top - tf->crop_bottom);
+		/* Fence values are authored in SOURCE pixels (the scene JSON is 4K-space),
+		   but imageBGRA is the downscaled readback - convert in. */
+		const float rbSX = tf->readbackScaleX > 0.0f ? tf->readbackScaleX : 1.0f;
+		const float rbSY = tf->readbackScaleY > 0.0f ? tf->readbackScaleY : 1.0f;
+		const int fLeft = (int)((float)tf->crop_left / rbSX);
+		const int fRight = (int)((float)tf->crop_right / rbSX);
+		const int fTop = (int)((float)tf->crop_top / rbSY);
+		const int fBottom = (int)((float)tf->crop_bottom / rbSY);
+		cv::Rect fence(fLeft, fTop, imageBGRA.cols - fLeft - fRight,
+			       imageBGRA.rows - fTop - fBottom);
 		fence &= cv::Rect(0, 0, imageBGRA.cols, imageBGRA.rows);
 		if (fence.width > 20 && fence.height > 20) {
 			cropRect = fence;
@@ -921,9 +944,16 @@ void detect_filter_video_tick(void *data, float seconds)
 	}
 
 	if (tf->minAreaThreshold > 0) {
+		/* The threshold is authored in SOURCE px^2, but obj.rect is in readback
+		   space - an area shrinks by the PRODUCT of both scales (div 3 => 1/9),
+		   so without this the filter would silently become ~9x stricter and
+		   throw away every distant detection. */
+		const float rbArea = (tf->readbackScaleX > 0.0f ? tf->readbackScaleX : 1.0f) *
+				     (tf->readbackScaleY > 0.0f ? tf->readbackScaleY : 1.0f);
+		const float minAreaRB = (float)tf->minAreaThreshold / rbArea;
 		std::vector<Object> filtered_objects;
 		for (const Object &obj : objects) {
-			if (obj.rect.area() > (float)tf->minAreaThreshold) {
+			if (obj.rect.area() > minAreaRB) {
 				filtered_objects.push_back(obj);
 			}
 		}
@@ -1322,16 +1352,22 @@ void detect_filter_video_tick(void *data, float seconds)
 		tf->trackingRect.y = std::max(
 			0.0f, std::min(tf->trackingRect.y, (float)rawH - tf->trackingRect.height));
 
-		// apply to the crop/pad filter (values are raw-frame pixels)
+		/* Apply to the crop/pad filter. trackingRect is in READBACK space; the
+		   crop filter works in SOURCE pixels, so scale out here. With div 1 the
+		   scales are 1.0 and sourceW/H equal rawW/H, i.e. identical to before. */
+		const float outSX = tf->readbackScaleX > 0.0f ? tf->readbackScaleX : 1.0f;
+		const float outSY = tf->readbackScaleY > 0.0f ? tf->readbackScaleY : 1.0f;
+		const float outW = tf->sourceW > 0 ? (float)tf->sourceW : (float)rawW * outSX;
+		const float outH = tf->sourceH > 0 ? (float)tf->sourceH : (float)rawH * outSY;
+		const float cropL = tf->trackingRect.x * outSX;
+		const float cropT = tf->trackingRect.y * outSY;
+		const float cropR = outW - (tf->trackingRect.x + tf->trackingRect.width) * outSX;
+		const float cropB = outH - (tf->trackingRect.y + tf->trackingRect.height) * outSY;
 		obs_data_t *crop_pad_settings = obs_source_get_settings(tf->trackingFilter);
-		obs_data_set_int(crop_pad_settings, "left", (int)tf->trackingRect.x);
-		obs_data_set_int(crop_pad_settings, "top", (int)tf->trackingRect.y);
-		obs_data_set_int(
-			crop_pad_settings, "right",
-			(int)((float)rawW - (tf->trackingRect.x + tf->trackingRect.width)));
-		obs_data_set_int(
-			crop_pad_settings, "bottom",
-			(int)((float)rawH - (tf->trackingRect.y + tf->trackingRect.height)));
+		obs_data_set_int(crop_pad_settings, "left", (int)std::max(0.0f, cropL));
+		obs_data_set_int(crop_pad_settings, "top", (int)std::max(0.0f, cropT));
+		obs_data_set_int(crop_pad_settings, "right", (int)std::max(0.0f, cropR));
+		obs_data_set_int(crop_pad_settings, "bottom", (int)std::max(0.0f, cropB));
 		obs_source_update(tf->trackingFilter, crop_pad_settings);
 		obs_data_release(crop_pad_settings);
 
@@ -1340,11 +1376,13 @@ void detect_filter_video_tick(void *data, float seconds)
 		static std::atomic<int> diag_counter{0};
 		if (++diag_counter % 600 == 0) {
 			obs_log(LOG_INFO,
-				"[detect-diag] '%s' captured %dx%d %s box %.0fx%.0f rect %.0f,%.0f %.0fx%.0f",
+				"[detect-diag] '%s' captured %dx%d (src %ux%u div %d) %s box %.0fx%.0f rect %.0f,%.0f %.0fx%.0f -> crop L%d T%d R%d B%d",
 				obs_source_get_name(obs_filter_get_parent(tf->source)), rawW, rawH,
+				tf->sourceW, tf->sourceH, tf->readbackDiv,
 				lostTracking ? "lost" : "live", boundingBox.width,
 				boundingBox.height, tf->trackingRect.x, tf->trackingRect.y,
-				tf->trackingRect.width, tf->trackingRect.height);
+				tf->trackingRect.width, tf->trackingRect.height, (int)cropL,
+				(int)cropT, (int)cropR, (int)cropB);
 		}
 	}
 }

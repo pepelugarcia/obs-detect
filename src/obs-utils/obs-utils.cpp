@@ -28,11 +28,33 @@ bool getRGBAFromStageSurface(filter_data *tf, uint32_t &width, uint32_t &height)
 	if (!target) {
 		return false;
 	}
-	width = obs_source_get_base_width(target);
-	height = obs_source_get_base_height(target);
-	if (width == 0 || height == 0) {
+	uint32_t srcWidth = obs_source_get_base_width(target);
+	uint32_t srcHeight = obs_source_get_base_height(target);
+	if (srcWidth == 0 || srcHeight == 0) {
 		return false;
 	}
+
+	/* Downscale ON THE GPU before the readback. This copy is synchronous and
+	   blocks the render thread, and a 4K BGRA frame is ~33MB; at div 3 a
+	   3840x2160 source becomes 1280x720 (~3.7MB, 1/9 the bytes). The detector
+	   letterboxes to at most 1280x736 anyway, so nothing it could use is lost.
+	   Floor of 320x180 so a small source can never collapse the input. */
+	int div = tf->readbackDiv < 1 ? 1 : (tf->readbackDiv > 4 ? 4 : tf->readbackDiv);
+	width = srcWidth / (uint32_t)div;
+	height = srcHeight / (uint32_t)div;
+	if (width < 320 || height < 180) {
+		width = srcWidth;
+		height = srcHeight;
+	}
+
+	/* Factors for the three coordinate boundaries in video_tick: the fence and
+	   min-area convert IN from source space, the crop values convert OUT to it.
+	   Everything between stays in readback space. */
+	tf->sourceW = srcWidth;
+	tf->sourceH = srcHeight;
+	tf->readbackScaleX = static_cast<float>(srcWidth) / static_cast<float>(width);
+	tf->readbackScaleY = static_cast<float>(srcHeight) / static_cast<float>(height);
+
 	gs_texrender_reset(tf->texrender);
 	if (!gs_texrender_begin(tf->texrender, width, height)) {
 		return false;
@@ -40,7 +62,9 @@ bool getRGBAFromStageSurface(filter_data *tf, uint32_t &width, uint32_t &height)
 	struct vec4 background;
 	vec4_zero(&background);
 	gs_clear(GS_CLEAR_COLOR, &background, 0.0f, 0);
-	gs_ortho(0.0f, static_cast<float>(width), 0.0f, static_cast<float>(height), -100.0f,
+	/* ortho spans the FULL source rect while the render target is width x height
+	   - that mismatch is what makes the GPU scale the frame down into it */
+	gs_ortho(0.0f, static_cast<float>(srcWidth), 0.0f, static_cast<float>(srcHeight), -100.0f,
 		 100.0f);
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);

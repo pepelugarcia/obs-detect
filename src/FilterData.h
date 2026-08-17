@@ -31,9 +31,22 @@ struct filter_data {
 	float boxHeightHist[5];    // rolling target-height window for the median filter
 	int boxHeightHistN;        // valid entries (reset while tracking is lost)
 	int boxHeightHistIdx;
-	int detectInterval;      // run readback+inference every Nth rendered frame (>=1)
-	int renderFrameCount;    // video_render gate counter for frame-skip
-	bool inputFresh;         // a captured frame is waiting for video_tick to consume
+	int detectInterval;   // run readback+inference every Nth rendered frame (>=1)
+	int renderFrameCount; // video_render gate counter for frame-skip
+	bool inputFresh;      // a captured frame is waiting for video_tick to consume
+	/* Detection readback downscale. The GPU->CPU copy in video_render is the
+	   render-thread stall (a 4K frame is ~33MB), yet the detector shrinks the
+	   frame to <=1280x736 anyway - so reading back at full 4K is wasted work.
+	   readbackDiv shrinks the staged surface on the GPU before the copy:
+	   div 3 on a 3840x2160 source = 1280x720 = ~1/9 the bytes.
+	   All tracking math stays in READBACK space; only three boundaries convert:
+	   the fence and min-area come IN from source space, and the crop values go
+	   OUT to source space, using readbackScaleX/Y. */
+	int readbackDiv;  // 1 = full-resolution readback (old behaviour)
+	uint32_t sourceW; // true source size of the last capture = crop output space
+	uint32_t sourceH;
+	float readbackScaleX;    // sourceW / readbackW
+	float readbackScaleY;    // sourceH / readbackH
 	int64_t lockedTrackId;   // director lock: SORT track id to follow (0 = automatic)
 	int tracksReportTick;    // throttle for publishing tracks_json into settings
 	bool lockAutoRelock;     // v2: re-attach a dead lock to the nearest newcomer
