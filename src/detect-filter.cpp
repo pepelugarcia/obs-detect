@@ -320,6 +320,11 @@ obs_properties_t *detect_filter_properties(void *data)
 	obs_properties_add_int_slider(props, "detect_scale", obs_module_text("DetectScale"), 1, 4,
 				      1);
 
+	/* How long a different person must stay the better candidate before the
+	   camera hands over. 0 = switch instantly (pre-0.0.21 behaviour). */
+	obs_properties_add_int_slider(props, "target_switch_hold",
+				      obs_module_text("TargetSwitchHold"), 0, 60, 1);
+
 	// add SORT tracking enabled checkbox
 	obs_properties_add_bool(props, "sort_tracking", obs_module_text("SORTTracking"));
 
@@ -475,6 +480,9 @@ void detect_filter_defaults(obs_data_t *settings)
 	   reads as choppy framing even while the output sits at a full 30fps. */
 	obs_data_set_default_int(settings, "detect_interval", 1);
 	obs_data_set_default_int(settings, "detect_scale", 3);
+	/* ~0.5s at 30fps: long enough that box noise can never trigger a handover,
+	   short enough that a real change of subject still feels responsive. */
+	obs_data_set_default_int(settings, "target_switch_hold", 15);
 	obs_data_set_default_string(settings, "save_detections_path", "");
 	obs_data_set_default_bool(settings, "crop_group", false);
 	obs_data_set_default_int(settings, "crop_left", 0);
@@ -511,6 +519,8 @@ void detect_filter_update(void *data, obs_data_t *settings)
 		tf->detectInterval = di < 1 ? 1 : (di > 10 ? 10 : di);
 		int ds = (int)obs_data_get_int(settings, "detect_scale");
 		tf->readbackDiv = ds < 1 ? 1 : (ds > 4 ? 4 : ds);
+		int th = (int)obs_data_get_int(settings, "target_switch_hold");
+		tf->targetSwitchHold = th < 0 ? 0 : (th > 60 ? 60 : th);
 	}
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
@@ -786,6 +796,10 @@ void *detect_filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->sourceH = 0;
 	tf->readbackScaleX = 1.0f;
 	tf->readbackScaleY = 1.0f;
+	tf->targetTrackId = (uint64_t)-1;
+	tf->challengerId = (uint64_t)-1;
+	tf->challengerFrames = 0;
+	tf->targetSwitchHold = 15;
 
 	std::vector<std::tuple<const char *, gs_effect_t **>> effects = {
 		{KAWASE_BLUR_EFFECT_PATH, &tf->kawaseBlurEffect},
@@ -1164,11 +1178,43 @@ void detect_filter_video_tick(void *data, float seconds)
 			}
 		}
 		if (!found) {
+			/* ---- TARGET STICKINESS -------------------------------------
+			   Previously the target was re-picked from scratch here on every
+			   inference with no memory of who we were following. Two people of
+			   similar apparent size therefore made "biggest" alternate between
+			   them as their boxes breathed by a few pixels, and the crop
+			   teleported across the room and back - the "glitch when it changes
+			   subject". A candidate was also only eligible while
+			   unseenFrames == 0, so ONE missed detection on the actor handed the
+			   camera to whoever else was in frame and snapped back after. At
+			   detect_interval 1 this runs 30x/second, which is why it reads as a
+			   twitch rather than a slow drift.
+
+			   Now: keep following one track, and only leave it when the incumbent
+			   is really gone, or a challenger is CLEARLY better AND stays better
+			   for targetSwitchHold inferences. Noise cannot survive that; a
+			   genuine change of subject can. targetSwitchHold = 0 restores the
+			   old instant-switch behaviour. */
+			const bool sticky = (tf->targetSwitchHold > 0 && tf->zoomObject != "all");
+			/* ride out a brief miss instead of surrendering the target */
+			const int graceUnseen = sticky ? 10 : 0;
+
+			const Object *incumbent = nullptr;
+			if (sticky && tf->targetTrackId != (uint64_t)-1) {
+				for (const Object &obj : objects) {
+					if (obj.id == tf->targetTrackId &&
+					    (int)obj.unseenFrames <= graceUnseen) {
+						incumbent = &obj;
+						break;
+					}
+				}
+			}
+
+			const Object *best = nullptr;
 			if (tf->zoomObject == "single") {
 				for (const Object &obj : objects) {
 					if (obj.unseenFrames == 0) {
-						targetBox = obj.rect;
-						found = true;
+						best = &obj;
 						break;
 					}
 				}
@@ -1180,8 +1226,7 @@ void detect_filter_video_tick(void *data, float seconds)
 					const float area = obj.rect.width * obj.rect.height;
 					if (area > maxArea) {
 						maxArea = area;
-						targetBox = obj.rect;
-						found = true;
+						best = &obj;
 					}
 				}
 			} else if (tf->zoomObject == "oldest") {
@@ -1189,8 +1234,7 @@ void detect_filter_video_tick(void *data, float seconds)
 				for (const Object &obj : objects) {
 					if (obj.unseenFrames == 0 && obj.id < oldestId) {
 						oldestId = obj.id;
-						targetBox = obj.rect;
-						found = true;
+						best = &obj;
 					}
 				}
 			} else {
@@ -1204,6 +1248,69 @@ void detect_filter_video_tick(void *data, float seconds)
 					} else {
 						targetBox |= obj.rect;
 					}
+				}
+			}
+
+			if (tf->zoomObject != "all") {
+				const Object *chosen = nullptr;
+				if (!sticky || incumbent == nullptr) {
+					chosen = best; // nothing to defend
+					tf->challengerId = (uint64_t)-1;
+					tf->challengerFrames = 0;
+				} else if (best == nullptr || best->id == incumbent->id) {
+					chosen = incumbent; // still ours
+					tf->challengerId = (uint64_t)-1;
+					tf->challengerFrames = 0;
+				} else {
+					bool clearlyBetter;
+					if (tf->zoomObject == "biggest") {
+						/* 25% bigger, not 2 pixels bigger */
+						const float ia = incumbent->rect.width *
+								 incumbent->rect.height;
+						const float ba =
+							best->rect.width * best->rect.height;
+						clearlyBetter = ba > ia * 1.25f;
+					} else if (tf->zoomObject == "oldest") {
+						clearlyBetter = best->id < incumbent->id;
+					} else {
+						/* "single": only yield if ours is blinking */
+						clearlyBetter = incumbent->unseenFrames > 0;
+					}
+					if (!clearlyBetter) {
+						chosen = incumbent;
+						tf->challengerId = (uint64_t)-1;
+						tf->challengerFrames = 0;
+					} else {
+						if (tf->challengerId == best->id) {
+							tf->challengerFrames++;
+						} else {
+							tf->challengerId = best->id;
+							tf->challengerFrames = 1;
+						}
+						if (tf->challengerFrames >= tf->targetSwitchHold) {
+							chosen = best;
+							tf->challengerId = (uint64_t)-1;
+							tf->challengerFrames = 0;
+							obs_log(LOG_INFO,
+								"[detect] '%s' target -> track %llu after %d held frames",
+								obs_source_get_name(
+									obs_filter_get_parent(
+										tf->source)),
+								(unsigned long long)best->id,
+								tf->targetSwitchHold);
+						} else {
+							chosen = incumbent;
+						}
+					}
+				}
+				if (chosen != nullptr) {
+					targetBox = chosen->rect;
+					found = true;
+					tf->targetTrackId = chosen->id;
+				} else {
+					tf->targetTrackId = (uint64_t)-1;
+					tf->challengerId = (uint64_t)-1;
+					tf->challengerFrames = 0;
 				}
 			}
 		}

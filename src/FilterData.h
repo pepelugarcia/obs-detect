@@ -45,8 +45,16 @@ struct filter_data {
 	int readbackDiv;  // 1 = full-resolution readback (old behaviour)
 	uint32_t sourceW; // true source size of the last capture = crop output space
 	uint32_t sourceH;
-	float readbackScaleX;    // sourceW / readbackW
-	float readbackScaleY;    // sourceH / readbackH
+	float readbackScaleX; // sourceW / readbackW
+	float readbackScaleY; // sourceH / readbackH
+	/* Target stickiness. The target used to be re-picked from scratch every
+	   inference with no memory of who we were following, so two similarly-sized
+	   people made "biggest" alternate between them and the crop teleported back
+	   and forth - the visible glitch when the subject changes. */
+	uint64_t targetTrackId;  // track we are following ((uint64_t)-1 = none)
+	uint64_t challengerId;   // candidate currently trying to take over
+	int challengerFrames;    // consecutive inferences it has been winning
+	int targetSwitchHold;    // inferences a challenger must win (0 = old behaviour)
 	int64_t lockedTrackId;   // director lock: SORT track id to follow (0 = automatic)
 	int tracksReportTick;    // throttle for publishing tracks_json into settings
 	bool lockAutoRelock;     // v2: re-attach a dead lock to the nearest newcomer

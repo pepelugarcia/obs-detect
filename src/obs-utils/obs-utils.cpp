@@ -40,6 +40,16 @@ bool getRGBAFromStageSurface(filter_data *tf, uint32_t &width, uint32_t &height)
 	   letterboxes to at most 1280x736 anyway, so nothing it could use is lost.
 	   Floor of 320x180 so a small source can never collapse the input. */
 	int div = tf->readbackDiv < 1 ? 1 : (tf->readbackDiv > 4 ? 4 : tf->readbackDiv);
+	/* The preview and masking paths DRAW this readback as the filter's output,
+	   so for them it must be full resolution - otherwise the source renders at
+	   1/div on screen (the 1/3-size regression in 0.0.20, seen the moment
+	   "Boxes" was switched on). Those are debug/composite modes, so paying the
+	   full readback cost there is the right trade; production (preview off)
+	   keeps the downscale. Mirrors how video_render already skips frame-skip
+	   while masking is enabled. */
+	if (tf->preview || tf->maskingEnabled) {
+		div = 1;
+	}
 	width = srcWidth / (uint32_t)div;
 	height = srcHeight / (uint32_t)div;
 	if (width < 320 || height < 180) {
