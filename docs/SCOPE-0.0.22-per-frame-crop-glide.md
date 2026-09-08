@@ -1,6 +1,6 @@
 # Scope — obs-detect 0.0.22: per-frame crop glide
 
-**Status:** implemented 2026-09-08 (flag default ON per Jose); CI green 2026-09-08 13:14 (runs 34218676853 feature / 34219360742 clang-format fix; commits 3aff8f9, a4a2ad8); DLL from the green run staged at C:/Users/Public/obs-detect-0.0.22-stage.dll (FileVersion 0.0.22, 13:18). NOT installed - live is 0.0.21; install after wrap with OBS closed via install_obs_detect_022.bat, then soak022.py. Install only with OBS closed, after wrap.
+**Status:** implemented 2026-09-08 (flag default ON per Jose); CI green 2026-09-08 13:14 (runs 34218676853 feature / 34219360742 clang-format fix; commits 3aff8f9, a4a2ad8); DLL from the green run staged at C:/Users/Public/obs-detect-0.0.22-stage.dll (FileVersion 0.0.22, 13:18). INSTALLED by Jose 2026-09-08 14:08; rig soak 14:13-14:32 = GO: the crop moves every rendered frame (dwell 33-41 ms vs ~67 before), pan reversals roughly halved vs 0.0.21 in a same-actor back-to-back A/B (12-22/min vs 25-33/min), skipped-frame A/B 0 vs 0 over 180 s per mode, render 29.35 vs 29.42 ms, hit-rate intact, no plugin errors. smooth_every_frame stays ON. Install only with OBS closed, after wrap.
 **Rig:** MOCAP-REMOTE, RTX 5060 Ti, four 4K DeckLink cams, OBS 32.1.2, canvas 2560×1440@30.
 **Written:** 2026-09-08, from measurements taken on the live rig that morning.
 
