@@ -1,6 +1,6 @@
 # Scope — obs-detect 0.0.22: per-frame crop glide
 
-**Status:** implemented 2026-09-08 (flag default ON per Jose); CI build and rig soak pending. Install only with OBS closed, after wrap.
+**Status:** implemented 2026-09-08 (flag default ON per Jose); CI green 2026-09-08 13:14 (runs 34218676853 feature / 34219360742 clang-format fix; commits 3aff8f9, a4a2ad8); DLL from the green run staged at C:/Users/Public/obs-detect-0.0.22-stage.dll (FileVersion 0.0.22, 13:18). NOT installed - live is 0.0.21; install after wrap with OBS closed via install_obs_detect_022.bat, then soak022.py. Install only with OBS closed, after wrap.
 **Rig:** MOCAP-REMOTE, RTX 5060 Ti, four 4K DeckLink cams, OBS 32.1.2, canvas 2560×1440@30.
 **Written:** 2026-09-08, from measurements taken on the live rig that morning.
 
