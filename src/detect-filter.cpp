@@ -474,11 +474,15 @@ void detect_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "locked_track_id", 0);
 	obs_data_set_default_bool(settings, "lock_auto_relock", true);
 	// frame-skip: readback+inference every Nth rendered frame (1 = every frame).
-	/* With detect_scale downscaling the readback (~1/9 the bytes at div 3),
-	   every-frame detection is affordable again - and every-frame is what makes
-	   panning smooth: at interval > 1 the crop HOLDS between updates, which
-	   reads as choppy framing even while the output sits at a full 30fps. */
+	/* The crop no longer holds between inferences: apply_crop_glide() eases it
+	   toward the last target on every rendered frame (0.0.22), so a higher
+	   interval costs detection latency, not pan smoothness. On four 4K cameras
+	   every-frame inference overloads the render thread (measured 2026-09-08:
+	   22 fps, a quarter of frames dropped); interval 2 holds a clean 30 fps. */
 	obs_data_set_default_int(settings, "detect_interval", 1);
+	/* smooth_every_frame: false restores the 0.0.21 behaviour (the crop moves only
+	   when the detector runs) - the live rollback lever, settable over websocket. */
+	obs_data_set_default_bool(settings, "smooth_every_frame", true);
 	obs_data_set_default_int(settings, "detect_scale", 3);
 	/* ~0.5s at 30fps: long enough that box noise can never trigger a handover,
 	   short enough that a real change of subject still feels responsive. */
@@ -521,6 +525,7 @@ void detect_filter_update(void *data, obs_data_t *settings)
 		tf->readbackDiv = ds < 1 ? 1 : (ds > 4 ? 4 : ds);
 		int th = (int)obs_data_get_int(settings, "target_switch_hold");
 		tf->targetSwitchHold = th < 0 ? 0 : (th > 60 ? 60 : th);
+		tf->smoothEveryFrame = obs_data_get_bool(settings, "smooth_every_frame");
 	}
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
@@ -800,6 +805,18 @@ void *detect_filter_create(obs_data_t *settings, obs_source_t *source)
 	tf->challengerId = (uint64_t)-1;
 	tf->challengerFrames = 0;
 	tf->targetSwitchHold = 15;
+	tf->smoothEveryFrame = true;
+	tf->targetValid = false;
+	tf->targetCX = 0.0f;
+	tf->targetCY = 0.0f;
+	tf->targetH = 0.0f;
+	tf->targetLost = false;
+	tf->rawW = 0;
+	tf->rawH = 0;
+	tf->lastCropL = -1;
+	tf->lastCropT = -1;
+	tf->lastCropR = -1;
+	tf->lastCropB = -1;
 
 	std::vector<std::tuple<const char *, gs_effect_t **>> effects = {
 		{KAWASE_BLUR_EFFECT_PATH, &tf->kawaseBlurEffect},
@@ -852,6 +869,117 @@ void detect_filter_destroy(void *data)
 	}
 }
 
+/* Real inference cadence: mirrors the frame-skip gate in video_render exactly
+   (masking bypasses frame-skip, so inference is then every frame). */
+static int glide_steps(const struct detect_filter *tf)
+{
+	return (tf->detectInterval > 1 && !tf->maskingEnabled) ? tf->detectInterval : 1;
+}
+
+/* A per-step factor f applied once per n frames leaves (1 - f) of the error;
+   applying f' every frame for n frames leaves (1 - f')^n. Equating gives
+   f' = 1 - (1 - f)^(1/n): the same convergence per detection interval,
+   delivered as n small steps instead of one. At n = 1 this is exactly f, so
+   interval 1 (and smooth_every_frame off) behave bit-for-bit like 0.0.21. */
+static float per_frame_factor(float f, int n)
+{
+	if (n <= 1) {
+		return f;
+	}
+	f = std::max(0.0f, std::min(f, 0.999f));
+	return 1.0f - std::pow(1.0f - f, 1.0f / (float)n);
+}
+
+/* Ease trackingRect toward the stored target and push the crop. This is the
+   0.0.21 smoothing math moved out of the inference branch so it can run on
+   every rendered frame: independent PAN/ZOOM axes, asymmetric zoom, 8% size
+   deadband, edge hugging, 15% implosion floor. n = rendered frames per
+   inference; the factors are rescaled accordingly. */
+static void apply_crop_glide(struct detect_filter *tf, int n)
+{
+	if (!tf->targetValid || tf->trackingRect.width == 0 || tf->rawW <= 0 || tf->rawH <= 0 ||
+	    !tf->trackingFilter) {
+		return;
+	}
+	const float rawW = (float)tf->rawW;
+	const float rawH = (float)tf->rawH;
+	const float frameAspectRatio = rawW / rawH;
+	const float lostMul = tf->targetLost ? 0.2f : 1.0f;
+
+	// PAN and ZOOM are fully independent axes (camera-operator model), each
+	// with its OWN smoothing speed. Both slow to 0.2x while re-acquiring.
+	const float posF = per_frame_factor(tf->zoomSpeedFactor * lostMul, n);
+	// ASYMMETRIC zoom (broadcast auto-framing behaviour): widening runs at 4x
+	// the slider rate (capped), tightening creeps at the slider rate, so
+	// pumping cannot sustain: the window parks near the recent maximum.
+	const float sizeInStep = tf->zoomSizeSpeedFactor * lostMul;
+	const float sizeInF = per_frame_factor(sizeInStep, n);
+	const float sizeOutF = per_frame_factor(std::min(sizeInStep * 4.0f, 0.06f), n);
+
+	// SIZE: soft deadband - ignore the first 8% of size error (posture noise),
+	// follow anything beyond it. Continuous in the input: no branch, no dither.
+	float sizeErr = tf->targetH - tf->trackingRect.height;
+	const float dead = tf->trackingRect.height * 0.08f;
+	if (sizeErr > dead) {
+		sizeErr -= dead;
+	} else if (sizeErr < -dead) {
+		sizeErr += dead;
+	} else {
+		sizeErr = 0.0f;
+	}
+	tf->trackingRect.height += (sizeErr > 0.0f ? sizeOutF : sizeInF) * sizeErr;
+	tf->trackingRect.width = tf->trackingRect.height * frameAspectRatio;
+
+	// POSITION: center the CURRENT window on the target's center - the target
+	// never depends on the size math, so size noise cannot shake the pan.
+	// Hug frame edges instead of padding out-of-frame black.
+	float tx = tf->targetCX - tf->trackingRect.width * 0.5f;
+	float ty = tf->targetCY - tf->trackingRect.height * 0.5f;
+	tx = std::max(0.0f, std::min(tx, rawW - tf->trackingRect.width));
+	ty = std::max(0.0f, std::min(ty, rawH - tf->trackingRect.height));
+	tf->trackingRect.x += posF * (tx - tf->trackingRect.x);
+	tf->trackingRect.y += posF * (ty - tf->trackingRect.y);
+
+	// clamp the smoothed rect in raw space, with the same implosion floor,
+	// so the applied crop is always a sane window
+	tf->trackingRect.width = std::max(std::min(tf->trackingRect.width, rawW), rawW * 0.15f);
+	tf->trackingRect.height = std::max(std::min(tf->trackingRect.height, rawH), rawH * 0.15f);
+	tf->trackingRect.x =
+		std::max(0.0f, std::min(tf->trackingRect.x, rawW - tf->trackingRect.width));
+	tf->trackingRect.y =
+		std::max(0.0f, std::min(tf->trackingRect.y, rawH - tf->trackingRect.height));
+
+	/* Apply to the crop/pad filter. trackingRect is in READBACK space; the
+	   crop filter works in SOURCE pixels, so scale out here. */
+	const float outSX = tf->readbackScaleX > 0.0f ? tf->readbackScaleX : 1.0f;
+	const float outSY = tf->readbackScaleY > 0.0f ? tf->readbackScaleY : 1.0f;
+	const float outW = tf->sourceW > 0 ? (float)tf->sourceW : rawW * outSX;
+	const float outH = tf->sourceH > 0 ? (float)tf->sourceH : rawH * outSY;
+	const int cropL = (int)std::max(0.0f, tf->trackingRect.x * outSX);
+	const int cropT = (int)std::max(0.0f, tf->trackingRect.y * outSY);
+	const int cropR =
+		(int)std::max(0.0f, outW - (tf->trackingRect.x + tf->trackingRect.width) * outSX);
+	const int cropB =
+		(int)std::max(0.0f, outH - (tf->trackingRect.y + tf->trackingRect.height) * outSY);
+	// the glide runs every frame, but sub-pixel motion rounds to the same ints
+	// most of the time - only touch the filter when the crop really changes
+	if (cropL == tf->lastCropL && cropT == tf->lastCropT && cropR == tf->lastCropR &&
+	    cropB == tf->lastCropB) {
+		return;
+	}
+	tf->lastCropL = cropL;
+	tf->lastCropT = cropT;
+	tf->lastCropR = cropR;
+	tf->lastCropB = cropB;
+	obs_data_t *crop_pad_settings = obs_source_get_settings(tf->trackingFilter);
+	obs_data_set_int(crop_pad_settings, "left", cropL);
+	obs_data_set_int(crop_pad_settings, "top", cropT);
+	obs_data_set_int(crop_pad_settings, "right", cropR);
+	obs_data_set_int(crop_pad_settings, "bottom", cropB);
+	obs_source_update(tf->trackingFilter, crop_pad_settings);
+	obs_data_release(crop_pad_settings);
+}
+
 void detect_filter_video_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -864,6 +992,13 @@ void detect_filter_video_tick(void *data, float seconds)
 
 	if (!obs_source_enabled(tf->source)) {
 		return;
+	}
+
+	// Per-frame crop glide (0.0.22): ease the crop toward the last target on
+	// EVERY rendered frame. 0.0.21 returned at the inputFresh gate below and
+	// left the crop holding between inferences - the stepped pan at interval > 1.
+	if (tf->trackingEnabled && tf->smoothEveryFrame) {
+		apply_crop_glide(tf, glide_steps(tf));
 	}
 
 	cv::Mat imageBGRA;
@@ -1404,92 +1539,34 @@ void detect_filter_video_tick(void *data, float seconds)
 			zx0 = std::max(0.0f, std::min(zx0, (float)rawW - zw));
 			zy0 = std::max(0.0f, std::min(zy0, (float)rawH - zh));
 			tf->trackingRect = cv::Rect2f(zx0, zy0, zw, zh);
-		} else {
-			// PAN and ZOOM are fully independent axes (camera-operator
-			// model), each with its OWN smoothing speed. Coupling them —
-			// or switching between size branches (the 0.0.10 deadband) —
-			// makes the position target jump when the size target changes,
-			// which reads as shake. Track speed drives pan; zoom (size)
-			// speed drives resize. Both slow to 0.2x while re-acquiring.
-			float posF = tf->zoomSpeedFactor * (lostTracking ? 0.2f : 1.0f);
-			// ASYMMETRIC zoom (broadcast auto-framing behaviour): widening
-			// (actor grew / came closer — protective) runs at 4x the slider
-			// rate; tightening creeps at the slider rate. Pumping cannot
-			// sustain when one direction crawls: the window parks near the
-			// recent maximum and only slowly creeps back in.
-			float sizeInF = tf->zoomSizeSpeedFactor * (lostTracking ? 0.2f : 1.0f);
-			float sizeOutF = std::min(sizeInF * 4.0f, 0.06f);
-
-			// SIZE: soft deadband — ignore the first 8% of size error
-			// entirely (posture noise), follow anything beyond it at the
-			// zoom-speed rate. Continuous in the input: no branch, no dither.
-			float sizeErr = zh - tf->trackingRect.height;
-			float dead = tf->trackingRect.height * 0.08f;
-			if (sizeErr > dead)
-				sizeErr -= dead;
-			else if (sizeErr < -dead)
-				sizeErr += dead;
-			else
-				sizeErr = 0.0f;
-			tf->trackingRect.height += (sizeErr > 0.0f ? sizeOutF : sizeInF) * sizeErr;
-			tf->trackingRect.width = tf->trackingRect.height * frameAspectRatio;
-
-			// POSITION: center the CURRENT window on the target's center —
-			// the target never depends on the size math, so size noise
-			// cannot shake the pan
-			float cx = boundingBox.x + boundingBox.width * 0.5f;
-			float cy = boundingBox.y + boundingBox.height * 0.5f;
-			float tx = cx - tf->trackingRect.width * 0.5f;
-			float ty = cy - tf->trackingRect.height * 0.5f;
-			// hug frame edges instead of padding out-of-frame black
-			tx = std::max(0.0f, std::min(tx, (float)rawW - tf->trackingRect.width));
-			ty = std::max(0.0f, std::min(ty, (float)rawH - tf->trackingRect.height));
-			tf->trackingRect.x += posF * (tx - tf->trackingRect.x);
-			tf->trackingRect.y += posF * (ty - tf->trackingRect.y);
 		}
-
-		// clamp the smoothed rect in raw space, with the same implosion
-		// floor, so the applied crop is always a sane window
-		tf->trackingRect.width = std::max(std::min(tf->trackingRect.width, (float)rawW),
-						  (float)rawW * 0.15f);
-		tf->trackingRect.height = std::max(std::min(tf->trackingRect.height, (float)rawH),
-						   (float)rawH * 0.15f);
-		tf->trackingRect.x = std::max(0.0f, std::min(tf->trackingRect.x,
-							     (float)rawW - tf->trackingRect.width));
-		tf->trackingRect.y = std::max(
-			0.0f, std::min(tf->trackingRect.y, (float)rawH - tf->trackingRect.height));
-
-		/* Apply to the crop/pad filter. trackingRect is in READBACK space; the
-		   crop filter works in SOURCE pixels, so scale out here. With div 1 the
-		   scales are 1.0 and sourceW/H equal rawW/H, i.e. identical to before. */
-		const float outSX = tf->readbackScaleX > 0.0f ? tf->readbackScaleX : 1.0f;
-		const float outSY = tf->readbackScaleY > 0.0f ? tf->readbackScaleY : 1.0f;
-		const float outW = tf->sourceW > 0 ? (float)tf->sourceW : (float)rawW * outSX;
-		const float outH = tf->sourceH > 0 ? (float)tf->sourceH : (float)rawH * outSY;
-		const float cropL = tf->trackingRect.x * outSX;
-		const float cropT = tf->trackingRect.y * outSY;
-		const float cropR = outW - (tf->trackingRect.x + tf->trackingRect.width) * outSX;
-		const float cropB = outH - (tf->trackingRect.y + tf->trackingRect.height) * outSY;
-		obs_data_t *crop_pad_settings = obs_source_get_settings(tf->trackingFilter);
-		obs_data_set_int(crop_pad_settings, "left", (int)std::max(0.0f, cropL));
-		obs_data_set_int(crop_pad_settings, "top", (int)std::max(0.0f, cropT));
-		obs_data_set_int(crop_pad_settings, "right", (int)std::max(0.0f, cropR));
-		obs_data_set_int(crop_pad_settings, "bottom", (int)std::max(0.0f, cropB));
-		obs_source_update(tf->trackingFilter, crop_pad_settings);
-		obs_data_release(crop_pad_settings);
+		/* Store the TARGET; the easing itself now lives in apply_crop_glide(), run on
+		   every rendered frame - or, with smooth_every_frame off, once right here,
+		   which is exactly the 0.0.21 behaviour. PAN and ZOOM stay independent axes. */
+		tf->targetH = zh;
+		tf->targetCX = boundingBox.x + boundingBox.width * 0.5f;
+		tf->targetCY = boundingBox.y + boundingBox.height * 0.5f;
+		tf->targetLost = lostTracking;
+		tf->rawW = (int)rawW;
+		tf->rawH = (int)rawH;
+		tf->targetValid = true;
+		if (!tf->smoothEveryFrame) {
+			apply_crop_glide(tf, 1);
+		}
 
 		// throttled geometry diagnostic: lets stability be verified from the
 		// log with measured numbers instead of assumptions
 		static std::atomic<int> diag_counter{0};
 		if (++diag_counter % 600 == 0) {
 			obs_log(LOG_INFO,
-				"[detect-diag] '%s' captured %dx%d (src %ux%u div %d) %s box %.0fx%.0f rect %.0f,%.0f %.0fx%.0f -> crop L%d T%d R%d B%d",
+				"[detect-diag] '%s' captured %dx%d (src %ux%u div %d) %s box %.0fx%.0f rect %.0f,%.0f %.0fx%.0f -> crop L%d T%d R%d B%d glide=%d",
 				obs_source_get_name(obs_filter_get_parent(tf->source)), rawW, rawH,
 				tf->sourceW, tf->sourceH, tf->readbackDiv,
 				lostTracking ? "lost" : "live", boundingBox.width,
 				boundingBox.height, tf->trackingRect.x, tf->trackingRect.y,
-				tf->trackingRect.width, tf->trackingRect.height, (int)cropL,
-				(int)cropT, (int)cropR, (int)cropB);
+				tf->trackingRect.width, tf->trackingRect.height, tf->lastCropL,
+				tf->lastCropT, tf->lastCropR, tf->lastCropB,
+				tf->smoothEveryFrame ? glide_steps(tf) : 1);
 		}
 	}
 }

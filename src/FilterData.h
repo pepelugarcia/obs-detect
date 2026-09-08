@@ -34,6 +34,22 @@ struct filter_data {
 	int detectInterval;   // run readback+inference every Nth rendered frame (>=1)
 	int renderFrameCount; // video_render gate counter for frame-skip
 	bool inputFresh;      // a captured frame is waiting for video_tick to consume
+	/* Per-frame crop glide (0.0.22). Inference sets a TARGET every detect_interval
+	   frames; video_tick eases trackingRect toward it EVERY rendered frame, so the
+	   pan moves at the render rate whatever the interval. Factors are rescaled per
+	   frame so the feel per detection interval is unchanged - see apply_crop_glide(). */
+	bool smoothEveryFrame; // "smooth_every_frame" (default true; false = 0.0.21 behaviour)
+	bool targetValid;      // a target has been computed since (re)start
+	float targetCX;        // target window centre, READBACK space
+	float targetCY;
+	float targetH;         // target window height after the median filter, READBACK space
+	bool targetLost;       // lostTracking at the last inference (easing runs at 0.2x)
+	int rawW;              // readback dimensions at the last inference (clamp space)
+	int rawH;
+	int lastCropL;         // last ints pushed to the crop filter; identical pushes are skipped
+	int lastCropT;
+	int lastCropR;
+	int lastCropB;
 	/* Detection readback downscale. The GPU->CPU copy in video_render is the
 	   render-thread stall (a 4K frame is ~33MB), yet the detector shrinks the
 	   frame to <=1280x736 anyway - so reading back at full 4K is wasted work.
