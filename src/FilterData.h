@@ -42,11 +42,11 @@ struct filter_data {
 	bool targetValid;      // a target has been computed since (re)start
 	float targetCX;        // target window centre, READBACK space
 	float targetCY;
-	float targetH;         // target window height after the median filter, READBACK space
-	bool targetLost;       // lostTracking at the last inference (easing runs at 0.2x)
-	int rawW;              // readback dimensions at the last inference (clamp space)
+	float targetH;   // target window height after the median filter, READBACK space
+	bool targetLost; // lostTracking at the last inference (easing runs at 0.2x)
+	int rawW;        // readback dimensions at the last inference (clamp space)
 	int rawH;
-	int lastCropL;         // last ints pushed to the crop filter; identical pushes are skipped
+	int lastCropL; // last ints pushed to the crop filter; identical pushes are skipped
 	int lastCropT;
 	int lastCropR;
 	int lastCropB;
